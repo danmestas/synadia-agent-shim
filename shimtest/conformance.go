@@ -132,7 +132,7 @@ var cases = []conformanceCase{
 			if err != nil {
 				t.Fatalf("subscribe: %v", err)
 			}
-			defer sub.Unsubscribe()
+			defer func() { _ = sub.Unsubscribe() }()
 			if err := nc.PublishRequest(subject, inbox, []byte("hello")); err != nil {
 				t.Fatalf("publish: %v", err)
 			}
@@ -219,7 +219,7 @@ var cases = []conformanceCase{
 			if err != nil {
 				t.Fatalf("subscribe hb: %v", err)
 			}
-			defer sub.Unsubscribe()
+			defer func() { _ = sub.Unsubscribe() }()
 			msg, err := sub.NextMsg(3 * time.Second)
 			if err != nil {
 				t.Fatalf("no heartbeat on %s: %v", hbSubject, err)
@@ -247,7 +247,7 @@ var cases = []conformanceCase{
 			if err != nil {
 				t.Fatalf("subscribe: %v", err)
 			}
-			defer sub.Unsubscribe()
+			defer func() { _ = sub.Unsubscribe() }()
 			if err := nc.PublishRequest(subject, inbox, []byte("")); err != nil {
 				t.Fatalf("publish: %v", err)
 			}
@@ -343,7 +343,7 @@ func runShimInBackground(t *testing.T, url string, cfg shim.Config) (*nats.Conn,
 	return nc, func() {
 		cancel()
 		<-done
-		nc.Drain()
+		_ = nc.Drain()
 	}
 }
 

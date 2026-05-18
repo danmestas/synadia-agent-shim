@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -253,7 +254,11 @@ func (a *Adapter) notifyMarker() string {
 // Notify marker → emit Query chunk so the caller can answer the
 // "Claude is waiting for input" prompt.
 func (a *Adapter) markerLoop(ctx context.Context, w *fsnotify.Watcher) {
-	defer w.Close()
+	defer func() {
+		if err := w.Close(); err != nil {
+			log.Printf("claudecode: marker watcher close: %v", err)
+		}
+	}()
 	stopPath := a.stopMarker()
 	notifyPath := a.notifyMarker()
 	for {

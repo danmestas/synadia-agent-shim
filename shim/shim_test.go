@@ -290,7 +290,7 @@ func runShimInBackground(t *testing.T, url string, cfg Config) (*nats.Conn, func
 	return nc, func() {
 		cancel()
 		<-done
-		nc.Drain()
+		_ = nc.Drain()
 	}
 }
 
@@ -383,6 +383,7 @@ func TestServiceDiscovery_INFO_HasExpectedShape(t *testing.T) {
 	}
 	if promptEP == nil {
 		t.Fatal("prompt endpoint missing from INFO")
+		return // unreachable; appeases staticcheck SA5011.
 	}
 	if promptEP.Metadata["max_payload"] == "" {
 		t.Error("prompt endpoint missing max_payload metadata")
@@ -425,7 +426,7 @@ func TestPromptStream_AckFirstThenChunksThenTerminator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	defer sub.Unsubscribe()
+	defer func() { _ = sub.Unsubscribe() }()
 
 	// Publish a prompt to the documented subject layout.
 	subject := "agents.prompt.cc.u.pct1"
@@ -487,7 +488,7 @@ func TestPromptStream_PreAckError_FollowedByTerminator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	defer sub.Unsubscribe()
+	defer func() { _ = sub.Unsubscribe() }()
 
 	if err := nc.PublishRequest("agents.prompt.cc.u.pct2", inbox, []byte("")); err != nil {
 		t.Fatalf("publish: %v", err)
@@ -540,7 +541,7 @@ func TestPromptStream_WatchdogEmitsTerminator_WhenAdapterSilent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	defer sub.Unsubscribe()
+	defer func() { _ = sub.Unsubscribe() }()
 
 	if err := nc.PublishRequest("agents.prompt.cc.u.pct102", inbox, []byte("hi")); err != nil {
 		t.Fatalf("publish: %v", err)
@@ -598,7 +599,7 @@ func TestPromptStream_WatchdogIdempotent_WhenAdapterTerminates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	defer sub.Unsubscribe()
+	defer func() { _ = sub.Unsubscribe() }()
 
 	if err := nc.PublishRequest("agents.prompt.cc.u.pct103", inbox, []byte("hi")); err != nil {
 		t.Fatalf("publish: %v", err)
@@ -793,7 +794,7 @@ func TestSignal_InterruptCancelsTurn_EmitsAbortedStatus_AndTerminator(t *testing
 	defer cleanup()
 
 	sub := promptAndDrainAck(t, nc, "agents.prompt.cc.u.pct9")
-	defer sub.Unsubscribe()
+	defer func() { _ = sub.Unsubscribe() }()
 
 	if err := nc.Publish("orch.signal.interrupt.cc.u.pct9", nil); err != nil {
 		t.Fatalf("publish interrupt: %v", err)
@@ -814,7 +815,7 @@ func TestSignal_InterruptCancelsTurn_EmitsAbortedStatus_AndTerminator(t *testing
 	// After interrupt, the active slot is released — a follow-up
 	// prompt must succeed (proves clearActive ran).
 	follow := promptAndDrainAck(t, nc, "agents.prompt.cc.u.pct9")
-	defer follow.Unsubscribe()
+	defer func() { _ = follow.Unsubscribe() }()
 	if calls := adapter.PromptCalls(); calls < 2 {
 		t.Errorf("expected ≥2 prompt calls after interrupt; got %d", calls)
 	}
@@ -844,7 +845,7 @@ func TestSignal_InterruptIsIdempotent_NoActiveTurnIsNoop(t *testing.T) {
 	// Active turn + two back-to-back interrupts: only the first fires
 	// Abort; the second observes an empty slot (coalescing).
 	sub := promptAndDrainAck(t, nc, "agents.prompt.cc.u.pct10")
-	defer sub.Unsubscribe()
+	defer func() { _ = sub.Unsubscribe() }()
 	for i := 0; i < 2; i++ {
 		if err := nc.Publish("orch.signal.interrupt.cc.u.pct10", nil); err != nil {
 			t.Fatalf("publish interrupt loop %d: %v", i, err)
@@ -864,7 +865,7 @@ func TestSignal_Redirect_StopsOldStream_StartsNewOnReply(t *testing.T) {
 	defer cleanup()
 
 	oldSub := promptAndDrainAck(t, nc, "agents.prompt.cc.u.pct11")
-	defer oldSub.Unsubscribe()
+	defer func() { _ = oldSub.Unsubscribe() }()
 
 	// Operator-supplied reply subject for the redirected turn. Real
 	// orch-interrupt mints an _INBOX; the test pins it so the
@@ -874,7 +875,7 @@ func TestSignal_Redirect_StopsOldStream_StartsNewOnReply(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subscribe new reply: %v", err)
 	}
-	defer newSub.Unsubscribe()
+	defer func() { _ = newSub.Unsubscribe() }()
 
 	body := []byte(`{"prompt":"new direction","reply":"` + newReply + `"}`)
 	if err := nc.Publish("orch.signal.redirect.cc.u.pct11", body); err != nil {
@@ -912,7 +913,6 @@ func TestSignal_Redirect_StopsOldStream_StartsNewOnReply(t *testing.T) {
 // emits status:aborted + terminator for adapters that don't implement
 // Aborter.
 type nonAborterPendingAdapter struct {
-	mu        sync.Mutex
 	ch        chan Chunk
 	closeOnce sync.Once
 }
@@ -936,7 +936,7 @@ func TestSignal_InterruptWithoutAborter_StillTerminatesStream(t *testing.T) {
 	defer cleanup()
 
 	sub := promptAndDrainAck(t, nc, "agents.prompt.cc.u.pct12")
-	defer sub.Unsubscribe()
+	defer func() { _ = sub.Unsubscribe() }()
 
 	if err := nc.Publish("orch.signal.interrupt.cc.u.pct12", nil); err != nil {
 		t.Fatalf("publish interrupt: %v", err)

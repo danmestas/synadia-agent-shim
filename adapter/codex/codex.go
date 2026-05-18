@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -209,7 +210,11 @@ func (a *Adapter) sessionsDir() string {
 // prompt visible. Don't add a notify-marker watch here without first
 // reconciling with idleQueryLoop or you'll get duplicate query chunks.
 func (a *Adapter) stopMarkerLoop(ctx context.Context, w *fsnotify.Watcher) {
-	defer w.Close()
+	defer func() {
+		if err := w.Close(); err != nil {
+			log.Printf("codex: stop-marker watcher close: %v", err)
+		}
+	}()
 	stopPath := a.stopMarker()
 	for {
 		select {

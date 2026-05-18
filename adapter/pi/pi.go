@@ -30,6 +30,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -225,7 +226,11 @@ func (a *Adapter) sessionsDir() string {
 // emitted BEFORE the terminator so the caller sees it while the stream
 // is still active.
 func (a *Adapter) markerLoop(ctx context.Context, w *fsnotify.Watcher) {
-	defer w.Close()
+	defer func() {
+		if err := w.Close(); err != nil {
+			log.Printf("pi: marker watcher close: %v", err)
+		}
+	}()
 	stopPath := a.stopMarker()
 	for {
 		select {

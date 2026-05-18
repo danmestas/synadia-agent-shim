@@ -116,7 +116,7 @@ func TestExtractPromptText(t *testing.T) {
 
 func TestEmitFromRolloutLine_AssistantText(t *testing.T) {
 	a, _, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 
 	line := []byte(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello codex"}]}`)
 	a.emitFromRolloutLine(line)
@@ -136,7 +136,7 @@ func TestEmitFromRolloutLine_AssistantText(t *testing.T) {
 
 func TestEmitFromRolloutLine_Reasoning(t *testing.T) {
 	a, _, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 
 	line := []byte(`{"type":"reasoning","summary":[{"type":"summary_text","text":"thinking hard"}]}`)
 	a.emitFromRolloutLine(line)
@@ -156,7 +156,7 @@ func TestEmitFromRolloutLine_Reasoning(t *testing.T) {
 
 func TestEmitFromRolloutLine_FunctionCall(t *testing.T) {
 	a, _, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 
 	line := []byte(`{"type":"function_call","name":"bash","arguments":"{\"cmd\":\"ls\"}"}`)
 	a.emitFromRolloutLine(line)
@@ -180,7 +180,7 @@ func TestEmitFromRolloutLine_FunctionCall(t *testing.T) {
 
 func TestEmitFromRolloutLine_UserLineIgnored(t *testing.T) {
 	a, _, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 
 	line := []byte(`{"type":"message","role":"user","content":[{"type":"input_text","text":"should be ignored"}]}`)
 	a.emitFromRolloutLine(line)
@@ -195,7 +195,7 @@ func TestEmitFromRolloutLine_UserLineIgnored(t *testing.T) {
 
 func TestEmitFromRolloutLine_ToleratesMalformedJSON(t *testing.T) {
 	a, _, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 
 	a.emitFromRolloutLine([]byte("not json at all"))
 
@@ -209,7 +209,7 @@ func TestEmitFromRolloutLine_ToleratesMalformedJSON(t *testing.T) {
 
 func TestEmitFromRolloutLine_ToleratesUnknownFields(t *testing.T) {
 	a, _, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 
 	line := []byte(`{"type":"message","role":"assistant","new_field":"ignored","content":[{"type":"output_text","text":"ok","extra":true}]}`)
 	a.emitFromRolloutLine(line)
@@ -287,7 +287,7 @@ func newTestAdapter(t *testing.T) (*Adapter, *sendKeysRecorder, string) {
 
 func TestAdapter_OnPrompt_SendsViaRecorder(t *testing.T) {
 	a, rec, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
 	if err := a.Start(shimCtx); err != nil {
@@ -313,7 +313,7 @@ func TestAdapter_OnPrompt_SendsViaRecorder(t *testing.T) {
 // deliver the prompt.
 func TestAdapter_OnPrompt_LazyStart(t *testing.T) {
 	a, rec, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 
 	// Deliberately skip Start — verify OnPrompt boots watchers itself.
 	promptCtx, promptCancel := context.WithCancel(context.Background())
@@ -349,7 +349,7 @@ func TestAdapter_OnPrompt_LazyStart(t *testing.T) {
 // Watchers MUST survive cancellation of OnPrompt's ctx.
 func TestAdapter_WatchersSurvivePromptCtxCancel(t *testing.T) {
 	a, _, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
 	if err := a.Start(shimCtx); err != nil {
@@ -399,7 +399,7 @@ func TestAdapter_Close_Idempotent(t *testing.T) {
 
 func TestAdapter_StopMarker_EmitsTerminator(t *testing.T) {
 	a, _, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
 	if err := a.Start(shimCtx); err != nil {
@@ -424,7 +424,7 @@ func TestAdapter_StopMarker_EmitsTerminator(t *testing.T) {
 
 func TestAdapter_Transcript_EmitsResponseChunks(t *testing.T) {
 	a, _, sessionsDir := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
 	if err := a.Start(shimCtx); err != nil {
@@ -466,7 +466,7 @@ func TestAdapter_IdleQuery_EmitsSyntheticQueryChunk(t *testing.T) {
 	stub := &capturePaneStub{}
 
 	a, _, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	// Override with our prompt-showing stub.
 	a.CapturePaneFn = stub.fn
 	a.idleThreshold = 150 * time.Millisecond
@@ -502,7 +502,7 @@ func TestAdapter_IdleQuery_NoChunk_WhenBufferChanges(t *testing.T) {
 	// longer than the threshold — so the pane never settles long enough.
 	stub := &capturePaneStub{}
 	a, _, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	a.CapturePaneFn = stub.fn
 	a.idleThreshold = 200 * time.Millisecond
 
@@ -536,7 +536,7 @@ func TestAdapter_IdleQuery_NoChunk_WhenBufferChanges(t *testing.T) {
 func TestAdapter_IdleQuery_NoChunk_WhenNoPromptPattern(t *testing.T) {
 	stub := &capturePaneStub{}
 	a, _, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	a.CapturePaneFn = stub.fn
 	a.idleThreshold = 100 * time.Millisecond
 
@@ -593,7 +593,7 @@ func TestIdleQueryLoop_BoundedHeap(t *testing.T) {
 
 	stub := &capturePaneStub{}
 	a, _, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	a.CapturePaneFn = stub.fn
 	a.idleThreshold = 2 * time.Millisecond // poll at 1ms
 
@@ -698,7 +698,7 @@ func appendLine(t *testing.T, path, line string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if _, err := f.WriteString(line + "\n"); err != nil {
 		t.Fatal(err)
 	}

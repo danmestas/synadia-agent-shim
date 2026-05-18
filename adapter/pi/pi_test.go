@@ -123,7 +123,7 @@ func newTestAdapter(t *testing.T) (*Adapter, *sendKeysRecorder, string) {
 
 func TestAdapter_OnPrompt_SendsViaRecorder(t *testing.T) {
 	a, rec, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
 	if err := a.Start(shimCtx); err != nil {
@@ -151,7 +151,7 @@ func TestAdapter_OnPrompt_SendsViaRecorder(t *testing.T) {
 // tore down the adapter permanently.
 func TestAdapter_WatchersSurvivePromptCtxCancel(t *testing.T) {
 	a, _, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
 	if err := a.Start(shimCtx); err != nil {
@@ -214,7 +214,7 @@ func TestAdapter_Close_Idempotent(t *testing.T) {
 // a synthetic Query chunk followed immediately by a Terminator chunk.
 func TestAdapter_StopMarker_EmitsSyntheticQueryThenTerminator(t *testing.T) {
 	a, _, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
 	if err := a.Start(shimCtx); err != nil {
@@ -261,7 +261,7 @@ func TestAdapter_StopMarker_EmitsSyntheticQueryThenTerminator(t *testing.T) {
 // transcript tailer picks up the pi JSONL and emits the correct chunks.
 func TestAdapter_Transcript_EmitsResponseChunksPerTextBlock(t *testing.T) {
 	a, _, piSessionsDir := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
 	if err := a.Start(shimCtx); err != nil {
@@ -321,7 +321,7 @@ func TestAdapter_Transcript_EmitsResponseChunksPerTextBlock(t *testing.T) {
 // unknown JSON fields in the transcript are silently ignored.
 func TestAdapter_Transcript_ToleratesUnknownFields(t *testing.T) {
 	a, _, piSessionsDir := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
 	if err := a.Start(shimCtx); err != nil {
@@ -343,7 +343,7 @@ func TestAdapter_Transcript_ToleratesUnknownFields(t *testing.T) {
 // JSONL line does not crash the tailer and subsequent lines still work.
 func TestAdapter_Transcript_MalformedLineDropped(t *testing.T) {
 	a, _, piSessionsDir := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
 	if err := a.Start(shimCtx); err != nil {
@@ -404,7 +404,7 @@ func appendLine(t *testing.T, path, line string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if _, err := f.WriteString(line + "\n"); err != nil {
 		t.Fatal(err)
 	}

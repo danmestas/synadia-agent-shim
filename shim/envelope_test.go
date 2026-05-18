@@ -71,10 +71,10 @@ func TestParseTraceparent_RejectsMalformed(t *testing.T) {
 	cases := []string{
 		"",
 		"not-a-traceparent",
-		"00-0af7-1234-01",                                                          // wrong lengths
-		"00-0af7651916cd43dd8448eb211c80319c-1234567890abcdef-0",                   // 1-char flag
-		"00-0af7651916cd43dd8448eb211c80319cZ-1234567890abcdef-01",                 // non-hex char
-		"00-0af7651916cd43dd8448eb211c80319c-1234567890abcdef-01-extra",            // trailing
+		"00-0af7-1234-01", // wrong lengths
+		"00-0af7651916cd43dd8448eb211c80319c-1234567890abcdef-0",        // 1-char flag
+		"00-0af7651916cd43dd8448eb211c80319cZ-1234567890abcdef-01",      // non-hex char
+		"00-0af7651916cd43dd8448eb211c80319c-1234567890abcdef-01-extra", // trailing
 	}
 	for _, c := range cases {
 		if got := parseTraceparent(c); got != "" {
@@ -215,7 +215,7 @@ func TestPromptStream_ChunksCarryEnvelopeHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	defer sub.Unsubscribe()
+	defer func() { _ = sub.Unsubscribe() }()
 
 	if err := nc.PublishRequest("agents.prompt.cc.u.pct200", inbox, []byte("hi")); err != nil {
 		t.Fatalf("publish: %v", err)
@@ -265,7 +265,7 @@ func TestPromptStream_PropagatesInboundTraceparent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	defer sub.Unsubscribe()
+	defer func() { _ = sub.Unsubscribe() }()
 
 	// Build a request with explicit inbound traceparent.
 	parentTrace := "4bf92f3577b34da6a3ce929d0e0e4736"
@@ -321,7 +321,7 @@ func TestPromptStream_NoInboundTrace_MintsFresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	defer sub.Unsubscribe()
+	defer func() { _ = sub.Unsubscribe() }()
 
 	if err := nc.PublishRequest("agents.prompt.cc.u.pct202", inbox, []byte("hi")); err != nil {
 		t.Fatalf("publish: %v", err)
@@ -432,7 +432,7 @@ func TestErrorOnReply_CarriesEnvelopeHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	defer sub.Unsubscribe()
+	defer func() { _ = sub.Unsubscribe() }()
 
 	if err := nc.PublishRequest("agents.prompt.cc.u.pct205", inbox, []byte("")); err != nil {
 		t.Fatalf("publish: %v", err)
@@ -469,7 +469,7 @@ func TestPromptStream_TaskIDOptional(t *testing.T) {
 		defer cleanup()
 		inbox := nats.NewInbox()
 		sub, _ := nc.SubscribeSync(inbox)
-		defer sub.Unsubscribe()
+		defer func() { _ = sub.Unsubscribe() }()
 		_ = nc.PublishRequest("agents.prompt.cc.u.pct206", inbox, []byte("hi"))
 		msgs := readStream(t, sub, 2, 2*time.Second)
 		if _, ok := msgs[0].Header[HeaderTaskID]; ok {
@@ -488,7 +488,7 @@ func TestPromptStream_TaskIDOptional(t *testing.T) {
 		defer cleanup()
 		inbox := nats.NewInbox()
 		sub, _ := nc.SubscribeSync(inbox)
-		defer sub.Unsubscribe()
+		defer func() { _ = sub.Unsubscribe() }()
 		_ = nc.PublishRequest("agents.prompt.cc.u.pct207", inbox, []byte("hi"))
 		msgs := readStream(t, sub, 2, 2*time.Second)
 		if got := msgs[0].Header.Get(HeaderTaskID); got != "01HXXTASK" {
@@ -496,4 +496,3 @@ func TestPromptStream_TaskIDOptional(t *testing.T) {
 		}
 	})
 }
-

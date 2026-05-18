@@ -183,7 +183,11 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("shim: nats dial %q: %w", cfg.NATSURL, err)
 	}
-	defer nc.Drain()
+	defer func() {
+		if err := nc.Drain(); err != nil {
+			log.Printf("shim: nats drain: %v", err)
+		}
+	}()
 
 	return RunWithConn(ctx, nc, cfg)
 }
@@ -745,7 +749,14 @@ func (s *shim) dispatchPrompt(reply string, prompt string, parentTrace string) *
 	// Mock harnesses that never close Events() would otherwise leave
 	// callers blocked on the §6.6 inactivity timeout (#102). Centralize
 	// the safety net here so no adapter can violate the invariant.
-	go s.watchdogTerminator(reply)
+	//
+	// Snapshot terminatorWatchdog HERE (on the caller goroutine) instead
+	// of reading it inside watchdogTerminator. Tests mutate the
+	// package-level value via t.Cleanup; reading it from a long-lived
+	// watchdog goroutine races with that cleanup after the test ends but
+	// before the goroutine's runCtx fires. Snapshotting at dispatch time
+	// pins the value to the prompt's lifetime, eliminating the race.
+	go s.watchdogTerminator(reply, terminatorWatchdog)
 	return nil
 }
 
@@ -866,12 +877,16 @@ func (s *shim) handleRedirect(body []byte) {
 }
 
 // watchdogTerminator force-emits a §6.5 terminator on `reply` if no
-// terminator has arrived by `terminatorWatchdog`. Idempotent with the
-// event pump's terminator path via finishStream's atomic check —
-// whichever fires first wins, the other observes a mismatched
-// activeReply and no-ops.
-func (s *shim) watchdogTerminator(reply string) {
-	t := time.NewTimer(terminatorWatchdog)
+// terminator has arrived by `timeout`. Idempotent with the event pump's
+// terminator path via finishStream's atomic check — whichever fires
+// first wins, the other observes a mismatched activeReply and no-ops.
+//
+// `timeout` is snapshotted by dispatchPrompt so this goroutine never
+// touches the package-level terminatorWatchdog, which tests mutate via
+// t.Cleanup (would otherwise race when the cleanup runs while a
+// watchdog goroutine from the same test is still draining).
+func (s *shim) watchdogTerminator(reply string, timeout time.Duration) {
+	t := time.NewTimer(timeout)
 	defer t.Stop()
 	select {
 	case <-s.runCtx.Done():

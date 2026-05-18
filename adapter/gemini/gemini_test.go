@@ -80,7 +80,7 @@ func appendLine(t *testing.T, path, line string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if _, err := f.WriteString(line + "\n"); err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func atomicWrite(t *testing.T, path, content string) {
 // TestAdapter_OnPrompt_SendsViaRecorder verifies the send-keys path.
 func TestAdapter_OnPrompt_SendsViaRecorder(t *testing.T) {
 	a, rec := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
@@ -146,7 +146,7 @@ func TestAdapter_OnPrompt_SendsViaRecorder(t *testing.T) {
 // canonical regression guard for that quirk.
 func TestAdapter_AfterAgent_EmitsTerminator(t *testing.T) {
 	a, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
@@ -173,7 +173,7 @@ func TestAdapter_AfterAgent_EmitsTerminator(t *testing.T) {
 // the query chunk unconditionally.
 func TestAdapter_Notification_EmitsQueryChunk(t *testing.T) {
 	a, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
@@ -209,7 +209,7 @@ func TestAdapter_Notification_EmitsQueryChunk(t *testing.T) {
 // OnPrompt's ctx, dismantling the adapter after the first turn.
 func TestAdapter_WatchersSurvivePromptCtxCancel(t *testing.T) {
 	a, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
@@ -261,7 +261,7 @@ func TestAdapter_Close_Idempotent(t *testing.T) {
 // role:"user" lines are ignored.
 func TestAdapter_Transcript_EmitsResponsePerModelLine(t *testing.T) {
 	a, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
 	if err := a.Start(shimCtx); err != nil {
@@ -300,7 +300,7 @@ func TestAdapter_Transcript_EmitsResponsePerModelLine(t *testing.T) {
 // functionCall part shape — gemini-cli emits these for tool invocations.
 func TestAdapter_Transcript_FunctionCallEmitsToolUse(t *testing.T) {
 	a, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
 	if err := a.Start(shimCtx); err != nil {
@@ -325,7 +325,7 @@ func TestAdapter_Transcript_FunctionCallEmitsToolUse(t *testing.T) {
 // JSON fields are silently dropped (forward-compat per §6.6 / §12).
 func TestAdapter_Transcript_ToleratesUnknownFields(t *testing.T) {
 	a, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
 	if err := a.Start(shimCtx); err != nil {
@@ -379,7 +379,7 @@ func TestFindLatestGeminiSession_EmptyDirReturnsEmpty(t *testing.T) {
 // marker file does not produce a chunk (defensive: hook write failure).
 func TestAdapter_EmptyNotifyMarker_Skipped(t *testing.T) {
 	a, _ := newTestAdapter(t)
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()

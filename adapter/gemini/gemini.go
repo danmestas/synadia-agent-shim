@@ -3,6 +3,7 @@
 //
 //  1. Tails gemini-cli's chat JSONL under ~/.gemini/tmp/<scope>/chats/
 //     and emits a Synadia response chunk per model-role line.
+//
 //  2. Watches ~/.cache/orch-stop/<pane>.event and
 //     ~/.cache/orch-notify/<pane>.notify, emitting typed Synadia chunks:
 //     stop → Terminator, notify → Query.
@@ -41,6 +42,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -327,12 +329,12 @@ func (a *Adapter) transcriptLoop(ctx context.Context) {
 // geminiChatEntry is the subset of gemini-cli's Content shape we act on.
 // Unknown fields drop silently via encoding/json (forward-compat).
 type geminiChatEntry struct {
-	Role  string            `json:"role"`
-	Parts []geminiChatPart  `json:"parts"`
+	Role  string           `json:"role"`
+	Parts []geminiChatPart `json:"parts"`
 }
 
 type geminiChatPart struct {
-	Text         string             `json:"text"`
+	Text         string              `json:"text"`
 	FunctionCall *geminiFunctionCall `json:"functionCall,omitempty"`
 }
 
@@ -402,7 +404,11 @@ func findLatestGeminiSession(root string) string {
 // Stop marker → Terminator chunk; Notify marker → Query chunk.
 // Atomic tmpfile-then-rename writes produce one CREATE event per turn.
 func (a *Adapter) markerLoop(ctx context.Context, w *fsnotify.Watcher) {
-	defer w.Close()
+	defer func() {
+		if err := w.Close(); err != nil {
+			log.Printf("gemini: marker watcher close: %v", err)
+		}
+	}()
 	stopPath := a.stopMarker()
 	notifyPath := a.notifyMarker()
 	for {

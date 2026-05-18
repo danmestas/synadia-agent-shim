@@ -116,7 +116,7 @@ var conformanceCases = []conformanceCase{
 			if err != nil {
 				t.Fatalf("subscribe: %v", err)
 			}
-			defer sub.Unsubscribe()
+			defer func() { _ = sub.Unsubscribe() }()
 			if err := nc.PublishRequest(subject, inbox, []byte("hello")); err != nil {
 				t.Fatalf("publish: %v", err)
 			}
@@ -208,7 +208,7 @@ var conformanceCases = []conformanceCase{
 			if err != nil {
 				t.Fatalf("subscribe hb: %v", err)
 			}
-			defer sub.Unsubscribe()
+			defer func() { _ = sub.Unsubscribe() }()
 			msg, err := sub.NextMsg(3 * time.Second)
 			if err != nil {
 				t.Fatalf("no heartbeat on %s: %v", hbSubject, err)
@@ -240,7 +240,7 @@ var conformanceCases = []conformanceCase{
 			if err != nil {
 				t.Fatalf("subscribe: %v", err)
 			}
-			defer sub.Unsubscribe()
+			defer func() { _ = sub.Unsubscribe() }()
 			if err := nc.PublishRequest(subject, inbox, []byte("")); err != nil {
 				t.Fatalf("publish: %v", err)
 			}
