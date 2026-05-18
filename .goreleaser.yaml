@@ -1,0 +1,65 @@
+version: 2
+
+project_name: synadia-agent-shim
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: synadia-agent-shim
+    main: ./cmd/synadia-agent-shim
+    binary: synadia-agent-shim
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.CommitDate}}
+
+archives:
+  - id: synadia-agent-shim
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  github:
+    owner: danmestas
+    name: synadia-agent-shim
+  draft: false
+  prerelease: auto
+  header: |
+    ## synadia-agent-shim {{ .Tag }}
+
+    Synadia Agent Protocol v0.3 shim binary. Wraps agent CLIs
+    (claude-code, codex, pi, gemini) and exposes them on a NATS bus.
+
+    npm-distributed via `@agent-ops/synadia-agent-shim` — the postinstall
+    fetches the right binary for your OS/arch from this release.
