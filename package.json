@@ -1,0 +1,44 @@
+{
+  "name": "@agent-ops/synadia-agent-shim",
+  "version": "1.0.0",
+  "description": "Synadia Agent Protocol v0.3 shim — wraps agent CLIs (claude-code, codex, pi, gemini) and exposes them on a NATS bus.",
+  "license": "Apache-2.0",
+  "author": "Daniel Mestas",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/danmestas/synadia-agent-shim.git"
+  },
+  "homepage": "https://github.com/danmestas/synadia-agent-shim",
+  "bugs": {
+    "url": "https://github.com/danmestas/synadia-agent-shim/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "synadia-agent-shim": "bin/synadia-agent-shim",
+    "orch-agent-shim": "bin/orch-agent-shim"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "keywords": [
+    "agent",
+    "agents",
+    "multi-agent",
+    "synadia",
+    "nats",
+    "claude-code",
+    "codex",
+    "gemini",
+    "tmux",
+    "orchestration",
+    "ai"
+  ]
+}

@@ -1,0 +1,27 @@
+#!/usr/bin/env node
+// orch-agent-shim — backwards-compat alias for synadia-agent-shim.
+// Shipped for one orch major release window per the extraction proposal
+// (docs/proposals/0001 in github.com/danmestas/orch). Delegates to the
+// same vendored binary as bin/synadia-agent-shim.
+
+const { spawnSync } = require("node:child_process");
+const path = require("node:path");
+const fs = require("node:fs");
+
+const bin = path.resolve(__dirname, "..", "vendor", "synadia-agent-shim");
+
+if (!fs.existsSync(bin)) {
+    process.stderr.write(
+        "orch-agent-shim: vendor binary missing.\n" +
+        "Run `npm install @agent-ops/synadia-agent-shim` to fetch it, " +
+        "or check scripts/postinstall.js logs.\n"
+    );
+    process.exit(127);
+}
+
+const result = spawnSync(bin, process.argv.slice(2), { stdio: "inherit" });
+if (result.error) {
+    process.stderr.write(`orch-agent-shim: ${result.error.message}\n`);
+    process.exit(1);
+}
+process.exit(result.status ?? 0);

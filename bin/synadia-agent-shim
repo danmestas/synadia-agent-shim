@@ -1,0 +1,30 @@
+#!/usr/bin/env node
+// synadia-agent-shim — npm wrapper that execs the vendored platform
+// binary fetched by scripts/postinstall.js. Cross-platform; works on
+// macOS + Linux where the binary lives at vendor/synadia-agent-shim.
+//
+// Why a node wrapper instead of a direct bin entry: npm's `bin` symlinks
+// need stable paths at install time, but the actual binary is OS/arch
+// specific and fetched at postinstall. The wrapper hides that detail.
+
+const { spawnSync } = require("node:child_process");
+const path = require("node:path");
+const fs = require("node:fs");
+
+const bin = path.resolve(__dirname, "..", "vendor", "synadia-agent-shim");
+
+if (!fs.existsSync(bin)) {
+    process.stderr.write(
+        "synadia-agent-shim: vendor binary missing.\n" +
+        "Run `npm install @agent-ops/synadia-agent-shim` to fetch it, " +
+        "or check scripts/postinstall.js logs.\n"
+    );
+    process.exit(127);
+}
+
+const result = spawnSync(bin, process.argv.slice(2), { stdio: "inherit" });
+if (result.error) {
+    process.stderr.write(`synadia-agent-shim: ${result.error.message}\n`);
+    process.exit(1);
+}
+process.exit(result.status ?? 0);
