@@ -134,6 +134,14 @@ type Config struct {
 	// Interval is the heartbeat cadence (§8.2). Defaults to 30s.
 	Interval time.Duration
 
+	// PaneWatchInterval is how often the pane-watchdog (shim/pane.go)
+	// asks tmux whether the bound pane still exists. Defaults to 30s
+	// via withDefaults — matching the heartbeat cadence so orphan-
+	// detection latency is bounded by the same number operators
+	// already think about. Empty Pane disables the watchdog entirely
+	// (preserves backwards-compat for non-tmux / CI callers).
+	PaneWatchInterval time.Duration
+
 	// Adapter wires the harness's stdio to the shim. Required.
 	Adapter Adapter
 
@@ -202,7 +210,14 @@ func RunWithConn(ctx context.Context, nc *nats.Conn, cfg Config) error {
 		return fmt.Errorf("shim: config: %w", err)
 	}
 
-	s := &shim{cfg: cfg, nc: nc, runCtx: ctx}
+	// Derive a cancellable context so the pane-watchdog (shim/pane.go)
+	// can self-cancel when the bound tmux pane disappears. Callers that
+	// pass an already-cancellable ctx still get their cancel signal
+	// honoured — context cancellation cascades.
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	s := &shim{cfg: cfg, nc: nc, runCtx: runCtx}
 	if err := s.start(); err != nil {
 		return err
 	}
@@ -210,14 +225,20 @@ func RunWithConn(ctx context.Context, nc *nats.Conn, cfg Config) error {
 
 	// Heartbeat publish loop (§8.2). Best-effort: a publish failure
 	// (broker hiccup, reconnect-in-progress) just retries on next tick.
-	go s.heartbeatLoop(ctx)
+	go s.heartbeatLoop(runCtx)
 
 	// Pump the adapter's event channel onto whichever reply subject the
 	// active prompt is using. Single goroutine, single active stream
 	// at a time — claude-code is inherently serial (one turn per pane).
-	go s.eventPump(ctx)
+	go s.eventPump(runCtx)
 
-	<-ctx.Done()
+	// Pane watchdog: cancels runCtx when the bound tmux pane is killed.
+	// No-op when cfg.Pane == "" (echo adapter, CI, conformance suite).
+	// nil check = production paneAliveTmux. See docs in shim/pane.go
+	// and paired orch issue #167.
+	go watchPane(runCtx, cfg.Pane, cfg.PaneWatchInterval, nil, cancel)
+
+	<-runCtx.Done()
 	return nil
 }
 
@@ -261,6 +282,9 @@ func withDefaults(cfg Config) Config {
 	}
 	if cfg.SignalPrefix == "" {
 		cfg.SignalPrefix = defaultSignalPrefix
+	}
+	if cfg.PaneWatchInterval <= 0 {
+		cfg.PaneWatchInterval = defaultPaneWatchInterval
 	}
 	return cfg
 }

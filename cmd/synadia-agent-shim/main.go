@@ -47,16 +47,17 @@ func main() {
 
 func run() error {
 	var (
-		agent    = flag.String("agent", "", "agent harness name — required (claude-code in v1; codex/pi/gemini to come in Plans 11-13)")
-		pane     = flag.String("pane", "", "tmux pane id (e.g. %37) — required")
-		owner    = flag.String("owner", "", "owner override (default $ORCH_OWNER or $USER)")
-		session  = flag.String("session", "", "session label override (default $SESH_SESSION)")
-		natsURL  = flag.String("nats", "", "NATS URL override (default $NATS_URL or ~/.sesh/hub.url)")
-		outfit   = flag.String("outfit", "", "outfit name (default $ORCH_OUTFIT)")
-		role     = flag.String("role", "", "role override (default $ORCH_ROLE, fallback worker)")
-		cwd      = flag.String("cwd", "", "working directory (default resolved via tmux)")
-		interval = flag.Duration("interval", 30*time.Second, "heartbeat interval")
-		taskID   = flag.String("task-id", "", "Sesh-Task-Id envelope header (default $ORCH_TASK_ID, empty omits header)")
+		agent             = flag.String("agent", "", "agent harness name — required (claude-code in v1; codex/pi/gemini to come in Plans 11-13)")
+		pane              = flag.String("pane", "", "tmux pane id (e.g. %37) — required")
+		owner             = flag.String("owner", "", "owner override (default $ORCH_OWNER or $USER)")
+		session           = flag.String("session", "", "session label override (default $SESH_SESSION)")
+		natsURL           = flag.String("nats", "", "NATS URL override (default $NATS_URL or ~/.sesh/hub.url)")
+		outfit            = flag.String("outfit", "", "outfit name (default $ORCH_OUTFIT)")
+		role              = flag.String("role", "", "role override (default $ORCH_ROLE, fallback worker)")
+		cwd               = flag.String("cwd", "", "working directory (default resolved via tmux)")
+		interval          = flag.Duration("interval", 30*time.Second, "heartbeat interval")
+		paneWatchInterval = flag.Duration("pane-watch-interval", 30*time.Second, "how often to poll tmux to see if the bound pane is still alive; empty --pane disables the watchdog")
+		taskID            = flag.String("task-id", "", "Sesh-Task-Id envelope header (default $ORCH_TASK_ID, empty omits header)")
 	)
 	flag.Parse()
 
@@ -66,16 +67,17 @@ func run() error {
 	}
 
 	cfg := shim.Config{
-		Agent:    *agent,
-		Pane:     *pane,
-		Owner:    firstNonEmpty(*owner, os.Getenv("ORCH_OWNER"), os.Getenv("USER")),
-		Session:  firstNonEmpty(*session, os.Getenv("SESH_SESSION")),
-		NATSURL:  shim.ReadNATSURL(*natsURL),
-		Outfit:   firstNonEmpty(*outfit, os.Getenv("ORCH_OUTFIT")),
-		Role:     firstNonEmpty(*role, os.Getenv("ORCH_ROLE")),
-		CWD:      firstNonEmpty(*cwd, resolveCWD(*pane)),
-		Interval: *interval,
-		TaskID:   firstNonEmpty(*taskID, os.Getenv("ORCH_TASK_ID")),
+		Agent:             *agent,
+		Pane:              *pane,
+		Owner:             firstNonEmpty(*owner, os.Getenv("ORCH_OWNER"), os.Getenv("USER")),
+		Session:           firstNonEmpty(*session, os.Getenv("SESH_SESSION")),
+		NATSURL:           shim.ReadNATSURL(*natsURL),
+		Outfit:            firstNonEmpty(*outfit, os.Getenv("ORCH_OUTFIT")),
+		Role:              firstNonEmpty(*role, os.Getenv("ORCH_ROLE")),
+		CWD:               firstNonEmpty(*cwd, resolveCWD(*pane)),
+		Interval:          *interval,
+		PaneWatchInterval: *paneWatchInterval,
+		TaskID:            firstNonEmpty(*taskID, os.Getenv("ORCH_TASK_ID")),
 	}
 
 	a, err := buildAdapter(*agent, *pane, cfg.CWD)
