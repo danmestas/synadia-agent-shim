@@ -112,7 +112,8 @@ type Config struct {
 	Session string
 
 	// NATSURL is the bus to dial. Resolution order in main.go:
-	// flag → $NATS_URL → ~/.sesh/hub.url.
+	// flag → $NATS_URL → ~/.sesh/hub.nats.url
+	// → ~/.sesh/hub.url (legacy, deprecated) → default localhost.
 	NATSURL string
 
 	// Outfit / Role / CWD / Harness become metadata fields the
@@ -1120,7 +1121,20 @@ func NewErrorChunk(code int, msg string, body map[string]any) Chunk {
 }
 
 // ReadNATSURL resolves the NATS URL using the documented precedence:
-// explicit override → env → ~/.sesh/hub.url → default localhost.
+//
+//	explicit override → $NATS_URL → ~/.sesh/hub.nats.url
+//	→ ~/.sesh/hub.url (legacy, deprecated) → default localhost.
+//
+// sesh writes three URL files (see sesh's cli/hubinfo.go): hub.url is
+// the *leaf-node* URL used by `sesh up` to solicit a leaf link and will
+// reject regular NATS clients with "attempted to connect to leaf node
+// port"; hub.nats.url is the dedicated NATS-client URL the shim wants;
+// hub.fossil.url is unrelated. Reading hub.url worked accidentally on
+// old hubs that exposed both protocols on one port — modern hubs split
+// them, so we read hub.nats.url first and only fall back to hub.url for
+// backwards compatibility with pre-sesh#65 installs (with a stderr
+// warning to nudge operators to upgrade).
+//
 // Exposed for main.go and behavior tests.
 func ReadNATSURL(override string) string {
 	if override != "" {
@@ -1130,9 +1144,16 @@ func ReadNATSURL(override string) string {
 		return v
 	}
 	if home, err := os.UserHomeDir(); err == nil {
-		hubPath := filepath.Join(home, ".sesh", "hub.url")
-		if data, err := os.ReadFile(hubPath); err == nil {
+		natsPath := filepath.Join(home, ".sesh", "hub.nats.url")
+		if data, err := os.ReadFile(natsPath); err == nil {
 			if v := strings.TrimSpace(string(data)); v != "" {
+				return v
+			}
+		}
+		legacyPath := filepath.Join(home, ".sesh", "hub.url")
+		if data, err := os.ReadFile(legacyPath); err == nil {
+			if v := strings.TrimSpace(string(data)); v != "" {
+				fmt.Fprintln(os.Stderr, "shim: reading legacy ~/.sesh/hub.url (deprecated — sesh now writes hub.nats.url for NATS clients); upgrade sesh to remove this warning")
 				return v
 			}
 		}

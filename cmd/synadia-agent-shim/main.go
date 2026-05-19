@@ -8,7 +8,8 @@
 //
 // Resolution order (most explicit wins):
 //
-//	NATS URL: --nats flag → $NATS_URL → ~/.sesh/hub.url → nats://127.0.0.1:4222
+//	NATS URL: --nats flag → $NATS_URL → ~/.sesh/hub.nats.url
+//	          → ~/.sesh/hub.url (legacy, deprecated) → nats://127.0.0.1:4222
 //	Owner:    --owner flag → $ORCH_OWNER → $USER → /etc/passwd lookup
 //	Session:  --session flag → $SESH_SESSION → "" (omitted from metadata)
 //	CWD:      --cwd flag → tmux display-message -p '#{pane_current_path}'
@@ -51,7 +52,7 @@ func run() error {
 		pane              = flag.String("pane", "", "tmux pane id (e.g. %37) — required")
 		owner             = flag.String("owner", "", "owner override (default $ORCH_OWNER or $USER)")
 		session           = flag.String("session", "", "session label override (default $SESH_SESSION)")
-		natsURL           = flag.String("nats", "", "NATS URL override (default $NATS_URL or ~/.sesh/hub.url)")
+		natsURL           = flag.String("nats", "", "NATS URL override (default $NATS_URL or ~/.sesh/hub.nats.url; legacy ~/.sesh/hub.url is read as a deprecated fallback)")
 		outfit            = flag.String("outfit", "", "outfit name (default $ORCH_OUTFIT)")
 		role              = flag.String("role", "", "role override (default $ORCH_ROLE, fallback worker)")
 		cwd               = flag.String("cwd", "", "working directory (default resolved via tmux)")
