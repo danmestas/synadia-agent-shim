@@ -67,6 +67,16 @@ type Adapter struct {
 	NotifyMarkerDir string
 	// ClaudeProjectsDir overrides ~/.claude/projects/. Tests use this.
 	ClaudeProjectsDir string
+	// SessionID, when non-empty, pins the transcript tailer to exactly
+	// `<ClaudeProjectsDir>/<encoded-cwd>/<SessionID>.jsonl` and disables
+	// the latest-mtime scan. This is the issue #11 fix: when multiple
+	// claude-code processes share a cwd (a developer's own session plus
+	// a shim-spawned TUI), mtime-discovery races and the shim ends up
+	// tailing the wrong JSONL. Callers (orch-spawn, sesh-tooling) snapshot
+	// `~/.claude/projects/<encoded>/` before spawning the wrapped claude
+	// and pass the new entry as `-session-id`. When empty, the legacy
+	// findLatestJSONL behaviour is preserved for backwards compatibility.
+	SessionID string
 	// SendKeys is the function invoked to deliver a prompt to the pane.
 	// Default is realSendKeys (which shells out to tmux). Tests
 	// substitute a recorder.
@@ -338,6 +348,27 @@ func (a *Adapter) transcriptLoop(ctx context.Context) {
 	dir := a.projectsDir()
 	encoded := encodeProjectPath(a.CWD)
 	target := filepath.Join(dir, encoded)
+	// pinned is the absolute path the SessionID branch opens, or "" when
+	// the legacy latest-mtime discovery is in effect. The discover
+	// closure isolates the choice so the tail loop below stays single-
+	// shape regardless of mode.
+	var pinned string
+	if a.SessionID != "" {
+		pinned = filepath.Join(target, a.SessionID+".jsonl")
+	}
+	discover := func() string {
+		if pinned != "" {
+			// Only open the pinned file once it exists; the wrapped
+			// claude-code TUI may not have written its first JSONL line
+			// yet at shim startup. Return "" until os.Stat succeeds so
+			// the loop keeps polling without falling back to mtime scan.
+			if _, err := os.Stat(pinned); err != nil {
+				return ""
+			}
+			return pinned
+		}
+		return findLatestJSONL(target)
+	}
 	var (
 		watchedFile *os.File
 		watchedPath string
@@ -358,20 +389,17 @@ func (a *Adapter) transcriptLoop(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		// Find the newest .jsonl in the project dir if we don't already
-		// have one open. claude-code creates a new file per session;
-		// we follow the latest.
 		if watchedFile == nil {
-			latest := findLatestJSONL(target)
-			if latest == "" {
+			candidate := discover()
+			if candidate == "" {
 				continue
 			}
-			f, err := os.Open(latest)
+			f, err := os.Open(candidate)
 			if err != nil {
 				continue
 			}
 			watchedFile = f
-			watchedPath = latest
+			watchedPath = candidate
 			offset = 0
 		}
 		// Read whatever has been appended since last poll.
@@ -397,11 +425,14 @@ func (a *Adapter) transcriptLoop(ctx context.Context) {
 		if err == nil {
 			offset = pos
 		}
-		// If a newer .jsonl appeared (new claude session), switch to it.
-		newest := findLatestJSONL(target)
-		if newest != "" && newest != watchedPath {
-			_ = watchedFile.Close()
-			watchedFile = nil
+		// Session-pinned mode: never switch files. Legacy mode: switch to
+		// the newest .jsonl if one appeared (new claude session).
+		if pinned == "" {
+			newest := findLatestJSONL(target)
+			if newest != "" && newest != watchedPath {
+				_ = watchedFile.Close()
+				watchedFile = nil
+			}
 		}
 	}
 }

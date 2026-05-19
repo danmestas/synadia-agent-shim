@@ -63,6 +63,15 @@ type Adapter struct {
 	StopMarkerDir string
 	// PiSessionsDir overrides ~/.pi/agent/sessions/. Tests use this.
 	PiSessionsDir string
+	// SessionID, when non-empty, pins the transcript tailer to the JSONL
+	// matching `<encoded-cwd>/*_<SessionID>.jsonl` and disables the
+	// latest-mtime scan. This is the issue #11 fix: when multiple pi
+	// processes share a cwd, mtime discovery races. Pi names its
+	// transcripts `<timestamp>_<session-uuid>.jsonl`, so we accept just
+	// the session-uuid suffix and resolve the timestamp prefix at
+	// startup by globbing the encoded-cwd dir. When empty, the legacy
+	// findLatestJSONL behaviour is preserved for backwards compatibility.
+	SessionID string
 	// SendKeys is the function invoked to deliver a prompt to the pane.
 	// Default is realSendKeys (which shells out to tmux). Tests substitute
 	// a recorder.
@@ -305,6 +314,23 @@ func (a *Adapter) transcriptLoop(ctx context.Context) {
 	encoded := encodePiPath(a.CWD)
 	sessionDir := filepath.Join(a.sessionsDir(), encoded)
 
+	// discover picks the JSONL to tail. When SessionID is set we glob
+	// `<sessionDir>/*_<SessionID>.jsonl` — pi writes `<ts>_<sid>.jsonl`
+	// and only the suffix is operator-knowable ahead of time. When
+	// SessionID is empty we fall back to mtime discovery.
+	discover := func() string {
+		if a.SessionID == "" {
+			return findLatestJSONL(sessionDir)
+		}
+		matches, err := filepath.Glob(filepath.Join(sessionDir, "*_"+a.SessionID+".jsonl"))
+		if err != nil || len(matches) == 0 {
+			return ""
+		}
+		// Multiple matches with the same session-id suffix would be a
+		// pi-side bug; first match is good enough.
+		return matches[0]
+	}
+
 	var (
 		watchedFile *os.File
 		watchedPath string
@@ -328,20 +354,17 @@ func (a *Adapter) transcriptLoop(ctx context.Context) {
 		case <-t.C:
 		}
 
-		// Find the newest .jsonl in the session dir if we don't already
-		// have one open. Pi creates a new file per session; we follow
-		// the latest.
 		if watchedFile == nil {
-			latest := findLatestJSONL(sessionDir)
-			if latest == "" {
+			candidate := discover()
+			if candidate == "" {
 				continue
 			}
-			f, err := os.Open(latest)
+			f, err := os.Open(candidate)
 			if err != nil {
 				continue
 			}
 			watchedFile = f
-			watchedPath = latest
+			watchedPath = candidate
 			offset = 0
 		}
 
@@ -366,11 +389,14 @@ func (a *Adapter) transcriptLoop(ctx context.Context) {
 		if err == nil {
 			offset = pos
 		}
-		// If a newer .jsonl appeared (new pi session), switch to it.
-		newest := findLatestJSONL(sessionDir)
-		if newest != "" && newest != watchedPath {
-			_ = watchedFile.Close()
-			watchedFile = nil
+		// Session-pinned mode: never switch files. Legacy mode: switch to
+		// the newest .jsonl if one appeared (new pi session).
+		if a.SessionID == "" {
+			newest := findLatestJSONL(sessionDir)
+			if newest != "" && newest != watchedPath {
+				_ = watchedFile.Close()
+				watchedFile = nil
+			}
 		}
 	}
 }

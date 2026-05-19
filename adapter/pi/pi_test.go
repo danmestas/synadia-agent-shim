@@ -317,6 +317,78 @@ func TestAdapter_Transcript_EmitsResponseChunksPerTextBlock(t *testing.T) {
 	}
 }
 
+// TestAdapter_Transcript_SessionIDPinsToNamedFile verifies issue #11
+// path (A) for pi: when SessionID is set the adapter MUST tail
+// exactly the JSONL whose filename matches `*_<session-id>.jsonl` in
+// the encoded-cwd session dir — even when a newer .jsonl exists from a
+// concurrent pi process.
+func TestAdapter_Transcript_SessionIDPinsToNamedFile(t *testing.T) {
+	a, _, piSessionsDir := newTestAdapter(t)
+	a.SessionID = "pinned"
+	defer a.Close()
+	shimCtx, shimCancel := context.WithCancel(context.Background())
+	defer shimCancel()
+
+	sessDir := filepath.Join(piSessionsDir, encodePiPath(a.CWD))
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Pinned file: older mtime, content the test asserts on.
+	pinned := filepath.Join(sessDir, "1000_pinned.jsonl")
+	appendLine(t, pinned, `{"type":"assistant","message":{"content":[{"type":"text","text":"from-pinned"}]}}`)
+	// Racy file: newer mtime, must NOT be tailed.
+	time.Sleep(20 * time.Millisecond)
+	racy := filepath.Join(sessDir, "2000_other.jsonl")
+	appendLine(t, racy, `{"type":"assistant","message":{"content":[{"type":"text","text":"from-other"}]}}`)
+
+	if err := a.Start(shimCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	c := receiveChunk(t, a.Events(), 2*time.Second)
+	if c.Type != shim.ChunkResponse {
+		t.Fatalf("expected response chunk, got %+v", c)
+	}
+	if s, _ := c.Data.(string); s != "from-pinned" {
+		t.Errorf("SessionID was ignored: got %q want %q", s, "from-pinned")
+	}
+
+	extra := drain(a.Events(), 1, 400*time.Millisecond)
+	for _, e := range extra {
+		if s, _ := e.Data.(string); s == "from-other" {
+			t.Errorf("adapter tailed the racy file despite SessionID pin: saw %q", s)
+		}
+	}
+}
+
+// TestAdapter_Transcript_NoSessionIDFallsBackToLatestMTime preserves the
+// pre-#11 behaviour for callers that don't supply a session id.
+func TestAdapter_Transcript_NoSessionIDFallsBackToLatestMTime(t *testing.T) {
+	a, _, piSessionsDir := newTestAdapter(t)
+	defer a.Close()
+	shimCtx, shimCancel := context.WithCancel(context.Background())
+	defer shimCancel()
+
+	sessDir := filepath.Join(piSessionsDir, encodePiPath(a.CWD))
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	older := filepath.Join(sessDir, "1000_older.jsonl")
+	appendLine(t, older, `{"type":"assistant","message":{"content":[{"type":"text","text":"from-older"}]}}`)
+	time.Sleep(20 * time.Millisecond)
+	newer := filepath.Join(sessDir, "2000_newer.jsonl")
+	appendLine(t, newer, `{"type":"assistant","message":{"content":[{"type":"text","text":"from-newer"}]}}`)
+
+	if err := a.Start(shimCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	c := receiveChunk(t, a.Events(), 2*time.Second)
+	if s, _ := c.Data.(string); s != "from-newer" {
+		t.Errorf("fallback to latest-mtime broke: got %q want %q", s, "from-newer")
+	}
+}
+
 // TestAdapter_Transcript_ToleratesUnknownFields verifies forward-compat:
 // unknown JSON fields in the transcript are silently ignored.
 func TestAdapter_Transcript_ToleratesUnknownFields(t *testing.T) {
