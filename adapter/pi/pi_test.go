@@ -325,7 +325,7 @@ func TestAdapter_Transcript_EmitsResponseChunksPerTextBlock(t *testing.T) {
 func TestAdapter_Transcript_SessionIDPinsToNamedFile(t *testing.T) {
 	a, _, piSessionsDir := newTestAdapter(t)
 	a.SessionID = "pinned"
-	defer a.Close()
+	t.Cleanup(func() { _ = a.Close() })
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
 
@@ -365,7 +365,7 @@ func TestAdapter_Transcript_SessionIDPinsToNamedFile(t *testing.T) {
 // pre-#11 behaviour for callers that don't supply a session id.
 func TestAdapter_Transcript_NoSessionIDFallsBackToLatestMTime(t *testing.T) {
 	a, _, piSessionsDir := newTestAdapter(t)
-	defer a.Close()
+	t.Cleanup(func() { _ = a.Close() })
 	shimCtx, shimCancel := context.WithCancel(context.Background())
 	defer shimCancel()
 
