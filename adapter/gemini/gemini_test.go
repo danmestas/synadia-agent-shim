@@ -375,6 +375,61 @@ func TestFindLatestGeminiSession_EmptyDirReturnsEmpty(t *testing.T) {
 	}
 }
 
+// TestAdapter_HappyPath_PromptResponseTerminator covers the full Synadia
+// per-turn sequence from the adapter's perspective (orch#134):
+//
+//  1. Caller invokes OnPrompt → adapter delivers via send-keys.
+//  2. The harness writes chat JSONL lines → adapter emits §6.3 response
+//     chunks containing the agent's user-visible reply text.
+//  3. The AfterAgent hook writes the stop marker → adapter emits the
+//     §6.5 terminator.
+//
+// This is the canonical regression guard for "wire-conformant but
+// content-mute" — the pre-#134 failure shape where the terminator fired
+// but no response chunks ever landed between the ack and the terminator.
+func TestAdapter_HappyPath_PromptResponseTerminator(t *testing.T) {
+	a, rec := newTestAdapter(t)
+	defer func() { _ = a.Close() }()
+	shimCtx, shimCancel := context.WithCancel(context.Background())
+	defer shimCancel()
+	if err := a.Start(shimCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Settle so fsnotify registers the marker-dir watches.
+	time.Sleep(50 * time.Millisecond)
+
+	// 1. Caller sends a prompt.
+	if err := a.OnPrompt(context.Background(), "say hello"); err != nil {
+		t.Fatalf("OnPrompt: %v", err)
+	}
+	calls := rec.snapshot()
+	if len(calls) != 1 || calls[0].Text != "say hello" {
+		t.Fatalf("send-keys: got %+v", calls)
+	}
+
+	// 2. gemini-cli writes a chat JSONL line under chatsDir/<scope>/chats/.
+	session := filepath.Join(a.GeminiChatsDir, "scope-x", "chats", "session-1.jsonl")
+	appendLine(t, session, `{"role":"model","parts":[{"text":"hello back"}]}`)
+
+	c := receiveChunk(t, a.Events(), 2*time.Second)
+	if c.Type != shim.ChunkResponse {
+		t.Fatalf("expected response chunk, got %+v", c)
+	}
+	if s, ok := c.Data.(string); !ok || s != "hello back" {
+		t.Fatalf("response payload: got %v want %q", c.Data, "hello back")
+	}
+
+	// 3. AfterAgent hook writes the stop marker → terminator. Remember:
+	// gemini-cli's turn-end event is AfterAgent, NOT Stop (the hook is
+	// wired under AfterAgent; we only see the file it creates here).
+	marker := filepath.Join(a.stopDir(), "%42.event")
+	atomicWrite(t, marker, `{"event":"AfterAgent","harness":"gemini"}`)
+	c = receiveChunk(t, a.Events(), 2*time.Second)
+	if !c.Terminator {
+		t.Fatalf("expected terminator after AfterAgent marker, got %+v", c)
+	}
+}
+
 // TestAdapter_EmptyNotifyMarker_Skipped verifies that an empty notify
 // marker file does not produce a chunk (defensive: hook write failure).
 func TestAdapter_EmptyNotifyMarker_Skipped(t *testing.T) {
