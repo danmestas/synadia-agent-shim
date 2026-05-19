@@ -389,6 +389,55 @@ func TestAdapter_Transcript_NoSessionIDFallsBackToLatestMTime(t *testing.T) {
 	}
 }
 
+// TestAdapter_Transcript_PartialLineRace_Issue13 regression-tests the
+// chunk-loss bug filed as issue #13 — same shape as the claudecode
+// mirror. A partial JSONL prefix is flushed to disk between polls;
+// the next poll must re-read the prefix together with the appended
+// completion bytes and emit the resulting line. Pre-fix the partial's
+// bytes get counted toward `offset`, so the next poll seeks past
+// them and json.Unmarshal silently rejects the trailing fragment.
+func TestAdapter_Transcript_PartialLineRace_Issue13(t *testing.T) {
+	a, _, piSessionsDir := newTestAdapter(t)
+	a.SessionID = "race"
+	t.Cleanup(func() { _ = a.Close() })
+	shimCtx, shimCancel := context.WithCancel(context.Background())
+	defer shimCancel()
+
+	sessDir := filepath.Join(piSessionsDir, encodePiPath(a.CWD))
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(sessDir, "1000_race.jsonl")
+
+	partial := `{"type":"assistant","message":{"content":[{"type":"text","text":"abcdefg"`
+	if err := os.WriteFile(transcript, []byte(partial), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := a.Start(shimCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	time.Sleep(400 * time.Millisecond)
+
+	f, err := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("}]}}\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	c := receiveChunk(t, a.Events(), 2*time.Second)
+	if c.Type != shim.ChunkResponse {
+		t.Fatalf("expected response chunk, got %+v", c)
+	}
+	if s, _ := c.Data.(string); s != "abcdefg" {
+		t.Errorf("partial-then-completed chunk lost: got %q want %q", s, "abcdefg")
+	}
+}
+
 // TestAdapter_Transcript_ToleratesUnknownFields verifies forward-compat:
 // unknown JSON fields in the transcript are silently ignored.
 func TestAdapter_Transcript_ToleratesUnknownFields(t *testing.T) {

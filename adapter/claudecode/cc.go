@@ -22,6 +22,7 @@ package claudecode
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -418,18 +419,35 @@ func (a *Adapter) transcriptLoop(ctx context.Context) {
 		// large — bump the default 64KB token cap to 8MB so we don't
 		// silently truncate mid-line.
 		sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+		// Custom split: emit ONLY complete newline-terminated lines and
+		// leave any trailing partial uncommitted, even at EOF (#13).
+		// The default bufio.ScanLines emits the trailing fragment as a
+		// final token when atEOF==true, which:
+		//   (a) feeds an invalid-JSON fragment to emitFromTranscriptLine
+		//       (dropped silently), and
+		//   (b) inflates our consumed-bytes counter so the next poll
+		//       seeks past the partial — when claude finishes writing
+		//       the line, we re-read only its tail and silently drop it
+		//       again. Net effect: the chunk for that assistant turn
+		//       never reaches the events channel.
+		// Returning (0, nil, nil) when no newline is found keeps the
+		// scanner in its idle-at-EOF state: Scan() returns false, the
+		// partial bytes stay in the scanner buffer (uncommitted), and
+		// `offset` advances ONLY by the bytes of complete lines we
+		// actually consumed.
+		sc.Split(scanCompleteLines)
+		var consumed int64
 		for sc.Scan() {
 			line := sc.Bytes()
+			// scanCompleteLines guarantees each token is followed by a
+			// newline in the file, so the real byte count is len(line)+1.
+			consumed += int64(len(line)) + 1
 			if len(line) == 0 {
 				continue
 			}
 			a.emitFromTranscriptLine(line)
 		}
-		// Update offset to the file's current position.
-		pos, err := watchedFile.Seek(0, 1)
-		if err == nil {
-			offset = pos
-		}
+		offset += consumed
 		// Session-pinned mode: never switch files. Legacy mode: switch to
 		// the newest .jsonl if one appeared (new claude session).
 		if pinned == "" {
@@ -526,6 +544,18 @@ func encodeProjectPath(p string) string {
 	p = strings.ReplaceAll(p, "/", "-")
 	p = strings.ReplaceAll(p, ".", "-")
 	return p
+}
+
+// scanCompleteLines is a bufio.SplitFunc that emits only complete
+// newline-terminated lines. Unlike bufio.ScanLines, it does NOT return
+// a trailing partial line at EOF — the caller relies on this to keep
+// its byte-offset counter anchored to the last complete-line boundary
+// across polls (see transcriptLoop, #13).
+func scanCompleteLines(data []byte, _ bool) (advance int, token []byte, err error) {
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	return 0, nil, nil
 }
 
 // findLatestJSONL returns the most-recently-modified .jsonl file in
