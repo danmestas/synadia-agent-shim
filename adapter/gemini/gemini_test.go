@@ -256,6 +256,113 @@ func TestAdapter_Close_Idempotent(t *testing.T) {
 	}
 }
 
+// TestAdapter_Transcript_SessionIDPinsToNamedFile verifies issue #11
+// path (A) for gemini: when SessionID is set the adapter MUST tail
+// exactly `session-<SessionID>.jsonl` under chatsDir — even when a
+// newer `session-*.jsonl` lives under a different scope.
+func TestAdapter_Transcript_SessionIDPinsToNamedFile(t *testing.T) {
+	a, _ := newTestAdapter(t)
+	a.SessionID = "pinned"
+	t.Cleanup(func() { _ = a.Close() })
+	shimCtx, shimCancel := context.WithCancel(context.Background())
+	defer shimCancel()
+
+	pinned := filepath.Join(a.GeminiChatsDir, "scope-a", "chats", "session-pinned.jsonl")
+	appendLine(t, pinned, `{"role":"model","parts":[{"text":"from-pinned"}]}`)
+
+	time.Sleep(20 * time.Millisecond)
+	racy := filepath.Join(a.GeminiChatsDir, "scope-b", "chats", "session-other.jsonl")
+	appendLine(t, racy, `{"role":"model","parts":[{"text":"from-other"}]}`)
+
+	if err := a.Start(shimCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	c := receiveChunk(t, a.Events(), 2*time.Second)
+	if c.Type != shim.ChunkResponse {
+		t.Fatalf("expected response chunk, got %+v", c)
+	}
+	if s, _ := c.Data.(string); s != "from-pinned" {
+		t.Errorf("SessionID was ignored: got %q want %q", s, "from-pinned")
+	}
+
+	extra := drain(a.Events(), 1, 400*time.Millisecond)
+	for _, e := range extra {
+		if s, _ := e.Data.(string); s == "from-other" {
+			t.Errorf("adapter tailed the racy session despite SessionID pin: saw %q", s)
+		}
+	}
+}
+
+// TestAdapter_Transcript_NoSessionIDFallsBackToLatestMTime preserves
+// the pre-#11 latest-mtime discovery for callers that don't pin.
+func TestAdapter_Transcript_NoSessionIDFallsBackToLatestMTime(t *testing.T) {
+	a, _ := newTestAdapter(t)
+	t.Cleanup(func() { _ = a.Close() })
+	shimCtx, shimCancel := context.WithCancel(context.Background())
+	defer shimCancel()
+
+	older := filepath.Join(a.GeminiChatsDir, "scope-a", "chats", "session-older.jsonl")
+	appendLine(t, older, `{"role":"model","parts":[{"text":"from-older"}]}`)
+	time.Sleep(20 * time.Millisecond)
+	newer := filepath.Join(a.GeminiChatsDir, "scope-b", "chats", "session-newer.jsonl")
+	appendLine(t, newer, `{"role":"model","parts":[{"text":"from-newer"}]}`)
+
+	if err := a.Start(shimCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	c := receiveChunk(t, a.Events(), 2*time.Second)
+	if s, _ := c.Data.(string); s != "from-newer" {
+		t.Errorf("fallback to latest-mtime broke: got %q want %q", s, "from-newer")
+	}
+}
+
+// TestAdapter_Transcript_PartialLineRace_Issue13 regression-tests #13:
+// a partial JSONL prefix flushed between polls must not poison the
+// next-poll offset. With the buggy `Seek(0, 1)` offset tracking the
+// assistant chunk would never reach the events channel.
+func TestAdapter_Transcript_PartialLineRace_Issue13(t *testing.T) {
+	a, _ := newTestAdapter(t)
+	a.SessionID = "race"
+	t.Cleanup(func() { _ = a.Close() })
+	shimCtx, shimCancel := context.WithCancel(context.Background())
+	defer shimCancel()
+
+	transcript := filepath.Join(a.GeminiChatsDir, "scope", "chats", "session-race.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	partial := `{"role":"model","parts":[{"text":"abcdefg"`
+	if err := os.WriteFile(transcript, []byte(partial), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := a.Start(shimCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	time.Sleep(400 * time.Millisecond)
+
+	f, err := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("}]}\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	c := receiveChunk(t, a.Events(), 2*time.Second)
+	if c.Type != shim.ChunkResponse {
+		t.Fatalf("expected response chunk, got %+v", c)
+	}
+	if s, _ := c.Data.(string); s != "abcdefg" {
+		t.Errorf("partial-then-completed chunk lost: got %q want %q", s, "abcdefg")
+	}
+}
+
 // TestAdapter_Transcript_EmitsResponsePerModelLine asserts that lines
 // with role:"model" produce one ChunkResponse per text part, and that
 // role:"user" lines are ignored.

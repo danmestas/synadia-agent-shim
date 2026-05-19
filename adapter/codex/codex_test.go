@@ -461,6 +461,130 @@ func TestAdapter_Transcript_EmitsResponseChunks(t *testing.T) {
 	}
 }
 
+// TestAdapter_Transcript_SessionIDPinsToNamedFile verifies issue #11
+// path (A) for codex: when SessionID is set the adapter MUST tail
+// exactly the rollout whose basename matches
+// `rollout-*-<SessionID>.jsonl` — even when another rollout under a
+// different date bucket has a newer mtime.
+func TestAdapter_Transcript_SessionIDPinsToNamedFile(t *testing.T) {
+	a, _, sessionsDir := newTestAdapter(t)
+	a.SessionID = "pinned"
+	t.Cleanup(func() { _ = a.Close() })
+	shimCtx, shimCancel := context.WithCancel(context.Background())
+	defer shimCancel()
+
+	// Pinned rollout under an older date bucket.
+	pinDir := filepath.Join(sessionsDir, "2024", "01", "01")
+	if err := os.MkdirAll(pinDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pinned := filepath.Join(pinDir, "rollout-1000-pinned.jsonl")
+	appendLine(t, pinned, `{"type":"message","role":"assistant","content":[{"type":"output_text","text":"from-pinned"}]}`)
+
+	// Racy rollout under a newer date bucket — must NOT be tailed.
+	time.Sleep(20 * time.Millisecond)
+	otherDir := filepath.Join(sessionsDir, "2026", "01", "01")
+	if err := os.MkdirAll(otherDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	racy := filepath.Join(otherDir, "rollout-2000-other.jsonl")
+	appendLine(t, racy, `{"type":"message","role":"assistant","content":[{"type":"output_text","text":"from-other"}]}`)
+
+	if err := a.Start(shimCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	c := receiveChunk(t, a.Events(), 2*time.Second)
+	if c.Type != shim.ChunkResponse {
+		t.Fatalf("expected response chunk, got %+v", c)
+	}
+	if s, _ := c.Data.(string); s != "from-pinned" {
+		t.Errorf("SessionID was ignored: got %q want %q", s, "from-pinned")
+	}
+
+	extra := drain(a.Events(), 1, 400*time.Millisecond)
+	for _, e := range extra {
+		if s, _ := e.Data.(string); s == "from-other" {
+			t.Errorf("adapter tailed the racy rollout despite SessionID pin: saw %q", s)
+		}
+	}
+}
+
+// TestAdapter_Transcript_NoSessionIDFallsBackToLatestMTime preserves
+// the pre-#11 latest-mtime discovery for callers that don't pin.
+func TestAdapter_Transcript_NoSessionIDFallsBackToLatestMTime(t *testing.T) {
+	a, _, sessionsDir := newTestAdapter(t)
+	t.Cleanup(func() { _ = a.Close() })
+	shimCtx, shimCancel := context.WithCancel(context.Background())
+	defer shimCancel()
+
+	olderDir := filepath.Join(sessionsDir, "2024", "01", "01")
+	_ = os.MkdirAll(olderDir, 0o755)
+	older := filepath.Join(olderDir, "rollout-1000-older.jsonl")
+	appendLine(t, older, `{"type":"message","role":"assistant","content":[{"type":"output_text","text":"from-older"}]}`)
+	time.Sleep(20 * time.Millisecond)
+	newerDir := filepath.Join(sessionsDir, "2026", "01", "01")
+	_ = os.MkdirAll(newerDir, 0o755)
+	newer := filepath.Join(newerDir, "rollout-2000-newer.jsonl")
+	appendLine(t, newer, `{"type":"message","role":"assistant","content":[{"type":"output_text","text":"from-newer"}]}`)
+
+	if err := a.Start(shimCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	c := receiveChunk(t, a.Events(), 2*time.Second)
+	if s, _ := c.Data.(string); s != "from-newer" {
+		t.Errorf("fallback to latest-mtime broke: got %q want %q", s, "from-newer")
+	}
+}
+
+// TestAdapter_Transcript_PartialLineRace_Issue13 regression-tests the
+// chunk-loss bug filed as issue #13: a partial JSONL prefix flushed
+// between polls must not poison the next-poll offset. With the buggy
+// `Seek(0, 1)` offset tracking the assistant chunk would never reach
+// the events channel.
+func TestAdapter_Transcript_PartialLineRace_Issue13(t *testing.T) {
+	a, _, sessionsDir := newTestAdapter(t)
+	a.SessionID = "race"
+	t.Cleanup(func() { _ = a.Close() })
+	shimCtx, shimCancel := context.WithCancel(context.Background())
+	defer shimCancel()
+
+	dayDir := filepath.Join(sessionsDir, "2026", "01", "01")
+	if err := os.MkdirAll(dayDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(dayDir, "rollout-1000-race.jsonl")
+
+	partial := `{"type":"message","role":"assistant","content":[{"type":"output_text","text":"abcdefg"`
+	if err := os.WriteFile(transcript, []byte(partial), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := a.Start(shimCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	time.Sleep(400 * time.Millisecond)
+
+	f, err := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("}]}\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	c := receiveChunk(t, a.Events(), 2*time.Second)
+	if c.Type != shim.ChunkResponse {
+		t.Fatalf("expected response chunk, got %+v", c)
+	}
+	if s, _ := c.Data.(string); s != "abcdefg" {
+		t.Errorf("partial-then-completed chunk lost: got %q want %q", s, "abcdefg")
+	}
+}
+
 func TestAdapter_IdleQuery_EmitsSyntheticQueryChunk(t *testing.T) {
 	// Use a short idle threshold so the test completes quickly.
 	stub := &capturePaneStub{}

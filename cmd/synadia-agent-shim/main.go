@@ -108,15 +108,17 @@ func buildAdapter(agent, pane, cwd, sessionID string) (shim.Adapter, error) {
 	case "codex":
 		// codex adapter: tails ~/.codex/sessions rollout JSONL, watches the
 		// orch-stop marker, and emits synthetic query chunks on idle detection.
-		// SessionID flag does NOT apply yet (issue #11 follow-up PR).
-		return codex.New(pane), nil
+		cx := codex.New(pane)
+		cx.SessionID = sessionID
+		return cx, nil
 	case "gemini":
 		// gemini-cli adapter. Uses AfterAgent (NOT Stop) for turn-end
 		// detection; native Notification events for query chunks.
 		// CWD is not used in v1 (transcript-path deferral — see
 		// internal/adapter/gemini/gemini.go TODO comment).
-		// SessionID flag does NOT apply yet (issue #11 follow-up PR).
-		return gemini.New(pane), nil
+		gm := gemini.New(pane)
+		gm.SessionID = sessionID
+		return gm, nil
 	case "pi":
 		p := pi.New(pane, cwd)
 		p.SessionID = sessionID
