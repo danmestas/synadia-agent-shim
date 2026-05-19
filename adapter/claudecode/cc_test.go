@@ -30,6 +30,81 @@ func TestEncodeProjectPath(t *testing.T) {
 	}
 }
 
+// TestResolveProjectDir_ResolvesSymlinks reproduces issue #15: when the
+// pane's cwd traverses a symlink (e.g. on macOS, /tmp → /private/tmp),
+// the adapter must encode the symlink-resolved path — otherwise it
+// watches a directory claude-code never writes to.
+//
+// We construct a real symlink inside the test tempdir, point cwd at it,
+// and assert resolveProjectDir returns the realpath (which differs from
+// the symlinked input).
+func TestResolveProjectDir_ResolvesSymlinks(t *testing.T) {
+	tmp := t.TempDir()
+	realDir := filepath.Join(tmp, "real")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := filepath.Join(tmp, "link")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Skipf("symlink not supported on this platform: %v", err)
+	}
+
+	// On macOS the TempDir itself may live under /var, which is a symlink
+	// to /private/var. EvalSymlinks resolves the entire chain — compare
+	// against the canonical form of the target rather than against
+	// realDir's literal value.
+	wantCanonical, err := filepath.EvalSymlinks(realDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(realDir): %v", err)
+	}
+
+	got := resolveProjectDir(linkDir)
+	if got != wantCanonical {
+		t.Errorf("resolveProjectDir(symlink): got %q want %q", got, wantCanonical)
+	}
+
+	// Sanity-check the regression we're guarding against: feeding the
+	// symlinked path straight into encodeProjectPath produces a DIFFERENT
+	// encoded result than feeding the resolved path. If these two ever
+	// became equal the bug-shape wouldn't reproduce and the regression
+	// test would silently pass.
+	if encodeProjectPath(linkDir) == encodeProjectPath(wantCanonical) {
+		t.Skip("symlink resolves to identical path; cannot exercise mismatch on this platform")
+	}
+	if encodeProjectPath(resolveProjectDir(linkDir)) != encodeProjectPath(wantCanonical) {
+		t.Errorf("resolveProjectDir+encodeProjectPath did not match canonical encoding")
+	}
+}
+
+// TestResolveProjectDir_FallsBackOnMissingPath confirms the documented
+// fallback: if EvalSymlinks errors (path doesn't exist yet), the literal
+// cwd is returned so the tail poller can reconcile once the directory
+// appears.
+func TestResolveProjectDir_FallsBackOnMissingPath(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist-yet")
+	got := resolveProjectDir(missing)
+	if got != missing {
+		t.Errorf("resolveProjectDir on missing path: got %q want %q (literal fallback)", got, missing)
+	}
+}
+
+// TestEncodeProjectPath_StraightPath confirms no regression on the
+// no-symlink case — paths that are already canonical encode identically
+// before and after the resolveProjectDir hop.
+func TestEncodeProjectPath_StraightPath(t *testing.T) {
+	dir := t.TempDir()
+	// On platforms where t.TempDir() returns a symlinked path (notably
+	// macOS where /tmp/* aliases /private/tmp/*), normalise once so
+	// the round-trip below is exercised against a canonical input.
+	canonical, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	if encodeProjectPath(canonical) != encodeProjectPath(resolveProjectDir(canonical)) {
+		t.Errorf("encodeProjectPath round-trip diverged on canonical input %q", canonical)
+	}
+}
+
 func TestFindLatestJSONL_PicksNewestByMTime(t *testing.T) {
 	dir := t.TempDir()
 	older := filepath.Join(dir, "older.jsonl")

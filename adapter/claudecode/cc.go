@@ -341,7 +341,7 @@ func (a *Adapter) emit(c shim.Chunk) {
 // and emit `response` chunks for assistant content blocks.
 func (a *Adapter) transcriptLoop(ctx context.Context) {
 	dir := a.projectsDir()
-	encoded := encodeProjectPath(a.CWD)
+	encoded := encodeProjectPath(resolveProjectDir(a.CWD))
 	target := filepath.Join(dir, encoded)
 	var (
 		watchedFile *os.File
@@ -491,10 +491,38 @@ func (a *Adapter) emitFromTranscriptLine(line []byte) {
 // one CWD value, so two panes only collide if they're at distinct paths
 // that happen to encode identically — and even then they get separate
 // session-id-keyed JSONL files inside the shared directory.
+//
+// IMPORTANT: callers MUST pass a symlink-resolved path. claude-code
+// resolves symlinks before encoding (e.g. on macOS, cwd `/tmp/foo`
+// becomes `-private-tmp-foo` because `/tmp` → `/private/tmp`). Pass
+// the cwd through resolveProjectDir first; otherwise the encoded path
+// won't match the directory claude actually writes to. See issue #15.
 func encodeProjectPath(p string) string {
 	p = strings.ReplaceAll(p, "/", "-")
 	p = strings.ReplaceAll(p, ".", "-")
 	return p
+}
+
+// resolveProjectDir returns the symlink-resolved form of cwd, suitable
+// for feeding into encodeProjectPath. On macOS, system paths like /tmp
+// are symlinks (/tmp → /private/tmp); claude-code's transcript writer
+// internally calls realpath(3) on the cwd before computing its project
+// directory name, so this shim must do the same or it watches a
+// non-existent directory.
+//
+// If EvalSymlinks fails (path doesn't exist yet — possible on cold-boot
+// when the cwd is about to be created, or on a transient FS race), we
+// fall back to the literal cwd. The transcript tail poller already
+// tolerates a missing target directory and will reconcile once the
+// path materialises.
+//
+// See issue #15 for the motivating bug.
+func resolveProjectDir(cwd string) string {
+	resolved, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		return cwd
+	}
+	return resolved
 }
 
 // findLatestJSONL returns the most-recently-modified .jsonl file in
