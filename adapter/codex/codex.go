@@ -20,6 +20,7 @@ package codex
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -53,6 +54,19 @@ type Adapter struct {
 
 	// CodexSessionsDir overrides ~/.codex/sessions/. Tests use this.
 	CodexSessionsDir string
+
+	// SessionID, when non-empty, pins the transcript tailer to the
+	// rollout JSONL whose basename matches `rollout-*-<SessionID>.jsonl`.
+	// Codex names rollouts `rollout-<ts>-<uuid>.jsonl` under
+	// `<sessionsDir>/<YYYY>/<MM>/<DD>/`; only the trailing UUID is
+	// operator-knowable ahead of time, so we walk the tree once at
+	// startup to recover the date bucket. Pinning disables the
+	// latest-mtime scan (issue #11): codex's date-bucketed discovery is
+	// not cwd-scoped, so ANY codex session on the host with a more
+	// recent mtime would otherwise win the race. When empty, the
+	// legacy findLatestRollout behaviour is preserved for backwards
+	// compatibility.
+	SessionID string
 
 	// SendKeys is the function invoked to deliver a prompt to the pane.
 	// Default is realSendKeys. Tests substitute a recorder.
@@ -257,6 +271,16 @@ func (a *Adapter) stopMarkerLoop(ctx context.Context, w *fsnotify.Watcher) {
 // the latest one, so re-scanning during an active turn is wasted work.
 func (a *Adapter) transcriptLoop(ctx context.Context) {
 	const rolloverIdleScan = 10 * time.Second
+	// discover picks the JSONL to tail. When SessionID is set we walk
+	// the date-bucketed tree once per poll for a basename matching
+	// `rollout-*-<SessionID>.jsonl`. When empty, fall back to the
+	// legacy newest-mtime scan.
+	discover := func() string {
+		if a.SessionID == "" {
+			return findLatestRollout(a.sessionsDir())
+		}
+		return findRolloutBySessionID(a.sessionsDir(), a.SessionID)
+	}
 	var (
 		watchedFile *os.File
 		watchedPath string
@@ -280,16 +304,16 @@ func (a *Adapter) transcriptLoop(ctx context.Context) {
 		}
 
 		if watchedFile == nil {
-			latest := findLatestRollout(a.sessionsDir())
-			if latest == "" {
+			candidate := discover()
+			if candidate == "" {
 				continue
 			}
-			f, err := os.Open(latest)
+			f, err := os.Open(candidate)
 			if err != nil {
 				continue
 			}
 			watchedFile = f
-			watchedPath = latest
+			watchedPath = candidate
 			offset = 0
 			lastActive = time.Now()
 		}
@@ -302,28 +326,35 @@ func (a *Adapter) transcriptLoop(ctx context.Context) {
 		sc := bufio.NewScanner(watchedFile)
 		// codex rollout lines can be large; bump the token cap to 8MB.
 		sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+		// scanCompleteLines refuses to tokenize a trailing partial at
+		// EOF and offset advances only by complete-line bytes (#13).
+		// The default ScanLines splitter would emit the partial as a
+		// final token, advancing the OS file pointer past it; the next
+		// poll would seek past the partial and silently drop the line
+		// when codex finishes flushing it.
+		sc.Split(scanCompleteLines)
+		var consumed int64
 		sawBytes := false
 		for sc.Scan() {
 			line := sc.Bytes()
+			consumed += int64(len(line)) + 1
 			if len(line) == 0 {
 				continue
 			}
 			sawBytes = true
 			a.emitFromRolloutLine(line)
 		}
-
-		pos, err := watchedFile.Seek(0, 1)
-		if err == nil {
-			offset = pos
-		}
+		offset += consumed
 		if sawBytes {
 			lastActive = time.Now()
 		}
 
-		// Rescan for a newer session ONLY when the current file has been
-		// idle for rolloverIdleScan. An actively-producing rollout is the
-		// latest by definition, so scanning during a turn is wasted work.
-		if time.Since(lastActive) >= rolloverIdleScan {
+		// Session-pinned mode: never rescan for a different file. Legacy
+		// mode: rescan for a newer session ONLY when the current file has
+		// been idle for rolloverIdleScan. An actively-producing rollout
+		// is the latest by definition, so scanning during a turn is
+		// wasted work.
+		if a.SessionID == "" && time.Since(lastActive) >= rolloverIdleScan {
 			newest := findLatestRollout(a.sessionsDir())
 			if newest != "" && newest != watchedPath {
 				_ = watchedFile.Close()
@@ -581,6 +612,85 @@ func (a *Adapter) emitFromRolloutLine(line []byte) {
 // ---------------------------------------------------------------------------
 // File helpers
 // ---------------------------------------------------------------------------
+
+// scanCompleteLines is a bufio.SplitFunc that emits only complete
+// newline-terminated lines. Unlike bufio.ScanLines, it does NOT return
+// a trailing partial line at EOF — transcriptLoop relies on this to
+// keep its byte-offset counter anchored to the last complete-line
+// boundary across polls (see #13).
+func scanCompleteLines(data []byte, _ bool) (advance int, token []byte, err error) {
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	return 0, nil, nil
+}
+
+// findRolloutBySessionID walks the codex date-bucketed sessions tree for
+// a rollout JSONL whose basename matches `rollout-*-<sessionID>.jsonl`.
+// Returns "" when no match exists yet (the codex TUI may not have
+// written its first rollout line at shim startup). When multiple files
+// match — which would be a codex-side bug — the most recently modified
+// one wins to favour the live session.
+func findRolloutBySessionID(sessionsDir, sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	suffix := "-" + sessionID + ".jsonl"
+	var bestPath string
+	var bestMTime time.Time
+	years, err := os.ReadDir(sessionsDir)
+	if err != nil {
+		return ""
+	}
+	for _, year := range years {
+		if !year.IsDir() {
+			continue
+		}
+		yearPath := filepath.Join(sessionsDir, year.Name())
+		months, err := os.ReadDir(yearPath)
+		if err != nil {
+			continue
+		}
+		for _, month := range months {
+			if !month.IsDir() {
+				continue
+			}
+			monthPath := filepath.Join(yearPath, month.Name())
+			days, err := os.ReadDir(monthPath)
+			if err != nil {
+				continue
+			}
+			for _, day := range days {
+				if !day.IsDir() {
+					continue
+				}
+				dayPath := filepath.Join(monthPath, day.Name())
+				entries, err := os.ReadDir(dayPath)
+				if err != nil {
+					continue
+				}
+				for _, e := range entries {
+					if e.IsDir() {
+						continue
+					}
+					name := e.Name()
+					if !strings.HasPrefix(name, "rollout-") || !strings.HasSuffix(name, suffix) {
+						continue
+					}
+					info, err := e.Info()
+					if err != nil {
+						continue
+					}
+					if info.ModTime().After(bestMTime) {
+						bestMTime = info.ModTime()
+						bestPath = filepath.Join(dayPath, name)
+					}
+				}
+			}
+		}
+	}
+	return bestPath
+}
 
 // findLatestRollout returns the path of the most-recently-modified rollout
 // JSONL across all date-bucketed directories under sessionsDir, or "" if none

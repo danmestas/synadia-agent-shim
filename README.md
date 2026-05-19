@@ -54,36 +54,43 @@ Resolution order (most explicit wins):
 The shim exits when the bound pane dies (SIGCHLD from the parent
 shell). `orch-spawn` backstops this by `wait`-ing on a sentinel pid.
 
-### `--session-id` (claudecode + pi)
+### `--session-id`
 
 `--session-id` pins the adapter to a specific harness-side JSONL transcript
 instead of picking the most-recently-modified file in the harness's shared
-project directory. Without this flag, a developer's own `claude` (or `pi`)
-process running in the same `cwd` races with the shim-managed one: the
-adapter tails whichever JSONL was written to last, so response chunks for
-the operator's prompt may never reach the reply subject. See [issue #11][i11]
-for a full reproducer.
+project directory. Without this flag, a developer's own concurrent harness
+process races with the shim-managed one: the adapter tails whichever JSONL
+was written to last, so response chunks for the operator's prompt may
+never reach the reply subject. See [issue #11][i11] for a full reproducer.
 
-Currently supported by the `claudecode` and `pi` adapters. `gemini` and
-`codex` discovery is global (not `cwd`-scoped), so the same flag for those
-two adapters will land in a follow-up PR.
+Supported by all four built-in transcript-tailing adapters
+(`claudecode`, `pi`, `codex`, `gemini`). The id format the flag expects
+depends on the harness's on-disk naming convention:
+
+| Harness | File layout | What `--session-id` accepts |
+| --- | --- | --- |
+| `claudecode` | `~/.claude/projects/<encoded-cwd>/<id>.jsonl` | `<id>` (the basename minus `.jsonl`) |
+| `pi` | `~/.pi/agent/sessions/<encoded-cwd>/<ts>_<id>.jsonl` | `<id>` (the suffix after `<ts>_`) |
+| `codex` | `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<id>.jsonl` | `<id>` (the suffix after `rollout-<ts>-`) |
+| `gemini` | `~/.gemini/tmp/<scope>/chats/session-<id>.jsonl` | `<id>` (the suffix after `session-`) |
+
+`<encoded-cwd>` is `cwd.replace(/[/.]/g, '-')` for both claude and pi.
 
 Recommended caller pattern (orch-spawn / sesh-tooling):
 
-1. **Snapshot the harness's session dir before spawning.** For claude:
-   `ls ~/.claude/projects/<encoded-cwd>/*.jsonl`. For pi:
-   `ls ~/.pi/agent/sessions/<encoded-cwd>/*.jsonl`. The `encoded-cwd` rule
-   is `cwd.replace(/[/.]/g, '-')` for both harnesses.
-2. **Spawn the harness in its pane.** `tmux send-keys -t %N "cd <cwd> && claude" Enter`.
-3. **Poll until exactly one new file appears.** The new entry's basename
-   minus the `.jsonl` suffix (claude) or the `_<uuid>` suffix (pi) is the
-   session id.
-4. **Spawn the shim with `--session-id`.** From then on the adapter opens
-   exactly that file and never scans the directory, so a concurrent
-   harness in the same `cwd` cannot win the mtime race.
+1. **Snapshot the harness's session dir before spawning.** Use `ls` on
+   the directory above.
+2. **Spawn the harness in its pane.** `tmux send-keys -t %N "cd <cwd> && <cmd>" Enter`.
+3. **Poll until exactly one new file appears**, then derive the id from
+   its basename per the table above.
+4. **Spawn the shim with `--session-id`.** From then on the adapter
+   opens exactly that file and never scans the directory, so a
+   concurrent harness cannot win the mtime race.
 
-For pi the flag accepts just the session-uuid (the part after `<ts>_`); the
-adapter globs `*_<session-id>.jsonl` to recover the timestamp prefix.
+`codex` and `gemini` discovery is not `cwd`-scoped (codex date-buckets;
+gemini uses an opaque scope dir), so `--session-id` is the *only* way to
+disambiguate when multiple sessions of those harnesses are live on the
+host.
 
 For Go library callers, the equivalent is `shim.Config{SessionID: "..."}`.
 Empty preserves the pre-#11 latest-mtime discovery for backwards

@@ -38,6 +38,7 @@ package gemini
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -78,6 +79,15 @@ type Adapter struct {
 	// walks the directory tree recursively for the newest
 	// `session-*.jsonl` file.
 	GeminiChatsDir string
+
+	// SessionID, when non-empty, pins the transcript tailer to the chat
+	// JSONL whose basename is `session-<SessionID>.jsonl` (anywhere
+	// under GeminiChatsDir). Disables the latest-mtime scan (issue #11):
+	// gemini-cli's discovery is not cwd-scoped at all — any session
+	// anywhere on the host with a more recent mtime would otherwise
+	// win the race. When empty, the legacy findLatestGeminiSession
+	// behaviour is preserved for backwards compatibility.
+	SessionID string
 
 	// SendKeys is the function invoked to deliver a prompt to the pane.
 	// Default is realSendKeys (which shells out to tmux). Tests
@@ -253,6 +263,16 @@ func (a *Adapter) chatsDir() string {
 // session is by definition the latest.
 func (a *Adapter) transcriptLoop(ctx context.Context) {
 	const rolloverIdleScan = 10 * time.Second
+	// discover picks the JSONL to tail. When SessionID is set we walk
+	// the chats tree once per poll for a basename matching
+	// `session-<SessionID>.jsonl`. When empty, fall back to the legacy
+	// newest-mtime scan.
+	discover := func() string {
+		if a.SessionID == "" {
+			return findLatestGeminiSession(a.chatsDir())
+		}
+		return findGeminiSessionByID(a.chatsDir(), a.SessionID)
+	}
 	var (
 		watchedFile *os.File
 		watchedPath string
@@ -276,16 +296,16 @@ func (a *Adapter) transcriptLoop(ctx context.Context) {
 		}
 
 		if watchedFile == nil {
-			latest := findLatestGeminiSession(a.chatsDir())
-			if latest == "" {
+			candidate := discover()
+			if candidate == "" {
 				continue
 			}
-			f, err := os.Open(latest)
+			f, err := os.Open(candidate)
 			if err != nil {
 				continue
 			}
 			watchedFile = f
-			watchedPath = latest
+			watchedPath = candidate
 			offset = 0
 			lastActive = time.Now()
 		}
@@ -298,23 +318,33 @@ func (a *Adapter) transcriptLoop(ctx context.Context) {
 		sc := bufio.NewScanner(watchedFile)
 		// Gemini chat lines can carry large function-call args; bump to 8MB.
 		sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+		// scanCompleteLines refuses to tokenize a trailing partial at
+		// EOF and offset advances only by complete-line bytes (#13).
+		// The default ScanLines splitter would emit the partial as a
+		// final token, advancing the OS file pointer past it; the next
+		// poll would seek past the partial and silently drop the line
+		// when gemini-cli finishes flushing it.
+		sc.Split(scanCompleteLines)
+		var consumed int64
 		sawBytes := false
 		for sc.Scan() {
 			line := sc.Bytes()
+			consumed += int64(len(line)) + 1
 			if len(line) == 0 {
 				continue
 			}
 			sawBytes = true
 			a.emitFromChatLine(line)
 		}
-		if pos, err := watchedFile.Seek(0, 1); err == nil {
-			offset = pos
-		}
+		offset += consumed
 		if sawBytes {
 			lastActive = time.Now()
 		}
 
-		if time.Since(lastActive) >= rolloverIdleScan {
+		// Session-pinned mode: never rescan for a different file. Legacy
+		// mode: rescan for a newer session only when the current file
+		// has been idle for rolloverIdleScan.
+		if a.SessionID == "" && time.Since(lastActive) >= rolloverIdleScan {
 			newest := findLatestGeminiSession(a.chatsDir())
 			if newest != "" && newest != watchedPath {
 				_ = watchedFile.Close()
@@ -364,6 +394,44 @@ func (a *Adapter) emitFromChatLine(line []byte) {
 			a.emit(shim.NewResponseChunk(p.Text))
 		}
 	}
+}
+
+// scanCompleteLines is a bufio.SplitFunc that emits only complete
+// newline-terminated lines. Unlike bufio.ScanLines, it does NOT return
+// a trailing partial line at EOF — transcriptLoop relies on this to
+// keep its byte-offset counter anchored to the last complete-line
+// boundary across polls (see #13).
+func scanCompleteLines(data []byte, _ bool) (advance int, token []byte, err error) {
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	return 0, nil, nil
+}
+
+// findGeminiSessionByID walks `root` for a chat JSONL whose basename is
+// exactly `session-<sessionID>.jsonl`. Returns "" when no match exists
+// (gemini-cli may not have written its first chat line yet at shim
+// startup).
+func findGeminiSessionByID(root, sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	want := "session-" + sessionID + ".jsonl"
+	var found string
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if d.Name() == want {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
 }
 
 // findLatestGeminiSession walks `root` recursively for the most-recently-
