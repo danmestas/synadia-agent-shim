@@ -660,6 +660,9 @@ func parseEnvelope(body []byte) (requestEnvelope, error) {
 
 // handlePrompt is the §5 / §6 dispatcher. It:
 //
+//   - rejects pub-mode prompts (no reply subject) with an operator-
+//     visible stderr log, mirroring Synadia's claude-code/server.ts
+//     guard (issue #6 / orch#137),
 //   - validates the envelope (§5.4 / §12: reject malformed with 400),
 //   - delegates the busy/ack/OnPrompt/watchdog work to dispatchPrompt,
 //   - maps dispatchPrompt's structured error (today: busy=503) to
@@ -671,6 +674,27 @@ func parseEnvelope(body []byte) (requestEnvelope, error) {
 // but we keep the option open). We accept new prompts only when no
 // other stream is active.
 func (s *shim) handlePrompt(req micro.Request) {
+	// §6.4 mandates the FIRST reply chunk is `ack` published on the
+	// caller's reply subject. A `nats pub` (no reply inbox) prompt has
+	// nowhere to publish the ack and every subsequent response chunk
+	// would be silently dropped by the event pump's "no active stream"
+	// guard. Reject early with a stderr log so operators who reach for
+	// `nats pub` instead of `nats req` get an immediate breadcrumb
+	// rather than a "Published N bytes" success that does nothing.
+	// Mirrors the Synadia reference implementation
+	// (claude-code/server.ts:653-663). See danmestas/orch#137 and
+	// this repo's #6.
+	if req.Reply() == "" {
+		// Extract trace context if present so the rejection is
+		// correlatable on the observability backend — we don't mint a
+		// fresh trace for a dropped message (no downstream publishes
+		// to correlate it to).
+		trace := traceFromHeaders(nats.Header(req.Headers()))
+		log.Printf("shim: pub-mode prompt rejected (no reply subject — use 'nats req' instead); subject=%s trace=%s",
+			req.Subject(), trace)
+		return
+	}
+
 	// Extract the inbound traceparent's trace_id once so every outbound
 	// publish on this prompt — early-exit rejection, ack, reply chunks,
 	// error chunk — shares the same trace. When the inbound carries no

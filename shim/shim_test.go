@@ -1,8 +1,10 @@
 package shim
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
 	"strings"
 	"sync"
 	"testing"
@@ -951,6 +953,140 @@ func TestSignal_InterruptWithoutAborter_StillTerminatesStream(t *testing.T) {
 	}
 }
 
+// -----------------------------------------------------------------------------
+// Pub-mode rejection (issue #6 / orch#137).
+// -----------------------------------------------------------------------------
+
+// syncBuffer is a bytes.Buffer with a mutex so the in-process shim
+// (running on the micro service's dispatcher goroutine) can write to it
+// via log.SetOutput while the test goroutine reads it via String().
+// The race detector flags the bare bytes.Buffer as unsafe across
+// goroutines; this is the smallest fix that keeps -race clean.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+// recordingAdapter records every OnPrompt call so the pub-mode rejection
+// test can assert the adapter was NOT dispatched to. Distinct from
+// pendingAdapter because that one only tracks Abort + last-prompt; this
+// one needs an inspectable counter at any test boundary.
+type recordingAdapter struct {
+	mu         sync.Mutex
+	ch         chan Chunk
+	closeOnce  sync.Once
+	onPrompted int
+}
+
+func newRecordingAdapter() *recordingAdapter {
+	return &recordingAdapter{ch: make(chan Chunk, 8)}
+}
+func (a *recordingAdapter) Start(_ context.Context) error { return nil }
+func (a *recordingAdapter) OnPrompt(_ context.Context, _ string) error {
+	a.mu.Lock()
+	a.onPrompted++
+	a.mu.Unlock()
+	return nil
+}
+func (a *recordingAdapter) Events() <-chan Chunk { return a.ch }
+func (a *recordingAdapter) Close() error {
+	a.closeOnce.Do(func() { close(a.ch) })
+	return nil
+}
+func (a *recordingAdapter) PromptCalls() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.onPrompted
+}
+
+// TestHandlePrompt_RejectsPubMode_WithStderrLog asserts that a prompt
+// published via `nats pub` (no reply inbox) is rejected before the
+// adapter is dispatched and that an operator-visible log line lands on
+// the package logger's writer. Mirrors Synadia's reference behavior
+// (claude-code/server.ts:653-663) — see issue #6 / orch#137.
+func TestHandlePrompt_RejectsPubMode_WithStderrLog(t *testing.T) {
+	// Capture the package logger's output (stderr in production) so we
+	// can assert the rejection message landed. log.SetOutput is process-
+	// global; restore on cleanup so concurrent / subsequent tests aren't
+	// affected. Use a mutex-wrapped buffer so the micro handler goroutine
+	// can write while the test goroutine reads (race-free).
+	var logBuf syncBuffer
+	origOut := log.Writer()
+	origFlags := log.Flags()
+	log.SetOutput(&logBuf)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(origOut)
+		log.SetFlags(origFlags)
+	})
+
+	url := startEmbeddedNATS(t)
+	adapter := newRecordingAdapter()
+	cfg := Config{
+		Agent: "claude-code", Pane: "%137", Owner: "u",
+		Adapter: adapter,
+	}
+	nc, cleanup := runShimInBackground(t, url, cfg)
+	defer cleanup()
+
+	// `nats pub` is `nc.Publish` — no reply inbox attached. This is the
+	// exact failure mode the issue reproduces.
+	if err := nc.Publish("agents.prompt.cc.u.pct137", []byte("hello")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	// Allow the in-process shim's micro service goroutine to dispatch.
+	// 200ms is generous — the rejection path is synchronous after the
+	// micro library hands the message to our handler.
+	time.Sleep(200 * time.Millisecond)
+
+	// 1. Stderr (via the log package) carries the rejection message.
+	logged := logBuf.String()
+	if !strings.Contains(logged, "pub-mode prompt rejected") {
+		t.Errorf("expected stderr to contain 'pub-mode prompt rejected'; got: %q", logged)
+	}
+	if !strings.Contains(logged, "agents.prompt.cc.u.pct137") {
+		t.Errorf("expected stderr to contain the prompt subject; got: %q", logged)
+	}
+
+	// 2. The adapter MUST NOT have been dispatched. This is the
+	//    operator-facing invariant — pub-mode prompts have no reply
+	//    inbox, so dispatching them would burn an agent turn whose
+	//    output gets discarded.
+	if n := adapter.PromptCalls(); n != 0 {
+		t.Errorf("adapter.OnPrompt invocations: got %d want 0", n)
+	}
+
+	// 3. A follow-up req-mode prompt on the same subject still works.
+	//    Proves the rejection path didn't leave the shim's active-reply
+	//    slot in a busy state. (Regression guard: if a future refactor
+	//    routes the pub-mode path through dispatchPrompt and forgets to
+	//    release the slot, this assertion would catch the busy-503
+	//    response.)
+	reply, err := nc.Request("agents.prompt.cc.u.pct137", []byte("hello again"), 1*time.Second)
+	if err != nil {
+		t.Fatalf("follow-up req-mode prompt failed: %v", err)
+	}
+	if got := string(reply.Data); !strings.Contains(got, `"type":"status","data":"ack"`) {
+		t.Errorf("follow-up req-mode reply: expected ack, got %s", got)
+	}
+	if n := adapter.PromptCalls(); n != 1 {
+		t.Errorf("req-mode follow-up: adapter.OnPrompt invocations got %d want 1", n)
+	}
+}
+
 // Compile-time assertion: nopAdapter and scriptedAdapter satisfy Adapter.
 var (
 	_ Adapter = (*nopAdapter)(nil)
@@ -958,6 +1094,7 @@ var (
 	_ Adapter = (*pendingAdapter)(nil)
 	_ Aborter = (*pendingAdapter)(nil)
 	_ Adapter = (*nonAborterPendingAdapter)(nil)
+	_ Adapter = (*recordingAdapter)(nil)
 )
 
 // Compile-time check for the embedded test server's option type so this
