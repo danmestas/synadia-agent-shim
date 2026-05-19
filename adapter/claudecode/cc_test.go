@@ -388,6 +388,71 @@ func TestAdapter_Transcript_NoSessionIDFallsBackToLatestMTime(t *testing.T) {
 	}
 }
 
+// TestAdapter_Transcript_PartialLineRace_Issue13 regression-tests the
+// chunk-loss bug filed as issue #13.
+//
+// Reproducer: the live claude TUI may flush a partial JSONL line
+// (prefix bytes without a terminating `\n`) into the transcript file
+// before the closing bytes arrive — multi-syscall fwrite is not atomic
+// at the FS level. The previous transcriptLoop drove `offset` from the
+// OS file pointer (`Seek(0, 1)`), which advances each time the bufio
+// scanner refills its buffer from disk — INCLUDING the partial-line
+// bytes the scanner read but dropped because no terminating newline was
+// found. On the next poll the loop seeks past the partial, re-reads
+// only the completion bytes, and feeds a JSON fragment to
+// `emitFromTranscriptLine`. `json.Unmarshal` fails silently and the
+// assistant chunk never reaches the events channel.
+//
+// Pre-fix this test fails with `timeout waiting for chunk` — the
+// partial-then-completed line never emits.
+func TestAdapter_Transcript_PartialLineRace_Issue13(t *testing.T) {
+	a, _, projectsDir := newTestAdapter(t)
+	a.SessionID = "race"
+	t.Cleanup(func() { _ = a.Close() })
+	shimCtx, shimCancel := context.WithCancel(context.Background())
+	defer shimCancel()
+
+	projDir := filepath.Join(projectsDir, encodeProjectPath(a.CWD))
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(projDir, "race.jsonl")
+
+	// Seed the file with the PREFIX of an assistant JSONL line —
+	// deliberately missing the trailing `\n`. Mirrors claude flushing
+	// mid-stream during a `say abcdefg` turn.
+	partial := `{"type":"assistant","message":{"content":[{"type":"text","text":"abcdefg"`
+	if err := os.WriteFile(transcript, []byte(partial), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := a.Start(shimCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Give the 250ms poll loop a chance to read-and-drop the partial.
+	time.Sleep(400 * time.Millisecond)
+
+	// Append the completion. From the FS's perspective this is the
+	// missing tail of the same line.
+	f, err := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("}]}}\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	c := receiveChunk(t, a.Events(), 2*time.Second)
+	if c.Type != shim.ChunkResponse {
+		t.Fatalf("expected response chunk, got %+v", c)
+	}
+	if s, _ := c.Data.(string); s != "abcdefg" {
+		t.Errorf("partial-then-completed chunk lost: got %q want %q", s, "abcdefg")
+	}
+}
+
 func TestAdapter_Transcript_ToleratesUnknownFields(t *testing.T) {
 	// §6.6 / §12: forward-compat means unknown fields are silently
 	// ignored. encoding/json drops them; we assert chunks still emit.

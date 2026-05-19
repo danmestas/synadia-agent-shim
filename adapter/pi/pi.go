@@ -26,6 +26,7 @@ package pi
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -382,18 +383,23 @@ func (a *Adapter) transcriptLoop(ctx context.Context) {
 		sc := bufio.NewScanner(watchedFile)
 		// Pi tool-result lines can be large — bump to 8MB to avoid silent truncation.
 		sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+		// scanCompleteLines refuses to tokenize a trailing partial at EOF
+		// and advances offset only by complete-line bytes (#13). The
+		// default ScanLines splitter would emit the partial as a final
+		// token, advancing the OS file pointer past it; the next poll
+		// would seek past the partial and silently drop the line when
+		// the TUI finishes flushing it.
+		sc.Split(scanCompleteLines)
+		var consumed int64
 		for sc.Scan() {
 			line := sc.Bytes()
+			consumed += int64(len(line)) + 1
 			if len(line) == 0 {
 				continue
 			}
 			a.emitFromTranscriptLine(line)
 		}
-		// Update offset to the file's current position.
-		pos, err := watchedFile.Seek(0, 1)
-		if err == nil {
-			offset = pos
-		}
+		offset += consumed
 		// Session-pinned mode: never switch files. Legacy mode: switch to
 		// the newest .jsonl if one appeared (new pi session).
 		if a.SessionID == "" {
@@ -468,6 +474,18 @@ func encodePiPath(p string) string {
 	p = strings.ReplaceAll(p, "/", "-")
 	p = strings.ReplaceAll(p, ".", "-")
 	return p
+}
+
+// scanCompleteLines is a bufio.SplitFunc that emits only complete
+// newline-terminated lines. Unlike bufio.ScanLines, it does NOT return
+// a trailing partial line at EOF — transcriptLoop relies on this to
+// keep its byte-offset counter anchored to the last complete-line
+// boundary across polls (see #13).
+func scanCompleteLines(data []byte, _ bool) (advance int, token []byte, err error) {
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	return 0, nil, nil
 }
 
 // findLatestJSONL returns the most-recently-modified .jsonl file in `dir`,
