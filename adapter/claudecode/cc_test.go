@@ -312,6 +312,82 @@ func TestAdapter_Transcript_EmitsResponseChunksPerTextBlock(t *testing.T) {
 	}
 }
 
+// TestAdapter_Transcript_SessionIDPinsToNamedFile verifies issue #11
+// path (A): when SessionID is set the adapter MUST open exactly
+// `<projects-dir>/<encoded-cwd>/<session-id>.jsonl` and tail only that
+// file — even when a newer .jsonl exists in the same directory (the
+// developer's own concurrent claude-code instance).
+//
+// Without SessionID the historical findLatestJSONL behaviour applies,
+// which the second half of this test pins in place.
+func TestAdapter_Transcript_SessionIDPinsToNamedFile(t *testing.T) {
+	a, _, projectsDir := newTestAdapter(t)
+	a.SessionID = "pinned-session"
+	t.Cleanup(func() { _ = a.Close() })
+	shimCtx, shimCancel := context.WithCancel(context.Background())
+	defer shimCancel()
+
+	projDir := filepath.Join(projectsDir, encodeProjectPath(a.CWD))
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Pinned file: older mtime, content the test asserts on.
+	pinned := filepath.Join(projDir, "pinned-session.jsonl")
+	appendLine(t, pinned, `{"type":"assistant","message":{"content":[{"type":"text","text":"from-pinned"}]}}`)
+	// Race file: newer mtime, must NOT be tailed.
+	time.Sleep(20 * time.Millisecond)
+	racy := filepath.Join(projDir, "other-session.jsonl")
+	appendLine(t, racy, `{"type":"assistant","message":{"content":[{"type":"text","text":"from-other"}]}}`)
+
+	if err := a.Start(shimCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	c := receiveChunk(t, a.Events(), 2*time.Second)
+	if c.Type != shim.ChunkResponse {
+		t.Fatalf("expected response chunk, got %+v", c)
+	}
+	if s, _ := c.Data.(string); s != "from-pinned" {
+		t.Errorf("SessionID was ignored: got %q want %q", s, "from-pinned")
+	}
+
+	// Drain anything additional to confirm "from-other" never arrives.
+	extra := drain(a.Events(), 1, 400*time.Millisecond)
+	for _, e := range extra {
+		if s, _ := e.Data.(string); s == "from-other" {
+			t.Errorf("adapter tailed the racy file despite SessionID pin: saw %q", s)
+		}
+	}
+}
+
+// TestAdapter_Transcript_NoSessionIDFallsBackToLatestMTime preserves the
+// pre-#11 behaviour for callers that don't supply a session id.
+func TestAdapter_Transcript_NoSessionIDFallsBackToLatestMTime(t *testing.T) {
+	a, _, projectsDir := newTestAdapter(t)
+	t.Cleanup(func() { _ = a.Close() })
+	shimCtx, shimCancel := context.WithCancel(context.Background())
+	defer shimCancel()
+
+	projDir := filepath.Join(projectsDir, encodeProjectPath(a.CWD))
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	older := filepath.Join(projDir, "older.jsonl")
+	appendLine(t, older, `{"type":"assistant","message":{"content":[{"type":"text","text":"from-older"}]}}`)
+	time.Sleep(20 * time.Millisecond)
+	newer := filepath.Join(projDir, "newer.jsonl")
+	appendLine(t, newer, `{"type":"assistant","message":{"content":[{"type":"text","text":"from-newer"}]}}`)
+
+	if err := a.Start(shimCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	c := receiveChunk(t, a.Events(), 2*time.Second)
+	if s, _ := c.Data.(string); s != "from-newer" {
+		t.Errorf("fallback to latest-mtime broke: got %q want %q", s, "from-newer")
+	}
+}
+
 func TestAdapter_Transcript_ToleratesUnknownFields(t *testing.T) {
 	// §6.6 / §12: forward-compat means unknown fields are silently
 	// ignored. encoding/json drops them; we assert chunks still emit.

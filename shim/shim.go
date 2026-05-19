@@ -111,6 +111,15 @@ type Config struct {
 	// §3.2 marks the agent as "session-aware". Empty = omitted.
 	Session string
 
+	// SessionID, when non-empty, pins the adapter to the specific
+	// harness-side JSONL transcript identified by this id (issue #11
+	// path A). Each adapter resolves the id against its own naming
+	// convention — claudecode opens `<encoded-cwd>/<SessionID>.jsonl`,
+	// pi globs `<encoded-cwd>/*_<SessionID>.jsonl`. Empty falls back to
+	// the historical latest-mtime discovery, preserving v1 behaviour for
+	// callers that don't yet know the harness's session id.
+	SessionID string
+
 	// NATSURL is the bus to dial. Resolution order in main.go:
 	// flag → $NATS_URL → ~/.sesh/hub.url.
 	NATSURL string

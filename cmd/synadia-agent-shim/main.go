@@ -8,10 +8,11 @@
 //
 // Resolution order (most explicit wins):
 //
-//	NATS URL: --nats flag → $NATS_URL → ~/.sesh/hub.url → nats://127.0.0.1:4222
-//	Owner:    --owner flag → $ORCH_OWNER → $USER → /etc/passwd lookup
-//	Session:  --session flag → $SESH_SESSION → "" (omitted from metadata)
-//	CWD:      --cwd flag → tmux display-message -p '#{pane_current_path}'
+//	NATS URL:   --nats flag → $NATS_URL → ~/.sesh/hub.url → nats://127.0.0.1:4222
+//	Owner:      --owner flag → $ORCH_OWNER → $USER → /etc/passwd lookup
+//	Session:    --session flag → $SESH_SESSION → "" (omitted from metadata)
+//	Session ID: --session-id flag → "" (falls back to latest-mtime discovery)
+//	CWD:        --cwd flag → tmux display-message -p '#{pane_current_path}'
 //
 // Lifetime: process exits when the pane it's bound to dies (SIGCHLD
 // from the parent shell does the right thing under most spawn setups;
@@ -55,8 +56,9 @@ func run() error {
 		outfit   = flag.String("outfit", "", "outfit name (default $ORCH_OUTFIT)")
 		role     = flag.String("role", "", "role override (default $ORCH_ROLE, fallback worker)")
 		cwd      = flag.String("cwd", "", "working directory (default resolved via tmux)")
-		interval = flag.Duration("interval", 30*time.Second, "heartbeat interval")
-		taskID   = flag.String("task-id", "", "Sesh-Task-Id envelope header (default $ORCH_TASK_ID, empty omits header)")
+		interval  = flag.Duration("interval", 30*time.Second, "heartbeat interval")
+		taskID    = flag.String("task-id", "", "Sesh-Task-Id envelope header (default $ORCH_TASK_ID, empty omits header)")
+		sessionID = flag.String("session-id", "", "harness-side session id pinning the JSONL transcript (claudecode + pi only; see README; empty falls back to latest-mtime discovery)")
 	)
 	flag.Parse()
 
@@ -66,19 +68,20 @@ func run() error {
 	}
 
 	cfg := shim.Config{
-		Agent:    *agent,
-		Pane:     *pane,
-		Owner:    firstNonEmpty(*owner, os.Getenv("ORCH_OWNER"), os.Getenv("USER")),
-		Session:  firstNonEmpty(*session, os.Getenv("SESH_SESSION")),
-		NATSURL:  shim.ReadNATSURL(*natsURL),
-		Outfit:   firstNonEmpty(*outfit, os.Getenv("ORCH_OUTFIT")),
-		Role:     firstNonEmpty(*role, os.Getenv("ORCH_ROLE")),
-		CWD:      firstNonEmpty(*cwd, resolveCWD(*pane)),
-		Interval: *interval,
-		TaskID:   firstNonEmpty(*taskID, os.Getenv("ORCH_TASK_ID")),
+		Agent:     *agent,
+		Pane:      *pane,
+		Owner:     firstNonEmpty(*owner, os.Getenv("ORCH_OWNER"), os.Getenv("USER")),
+		Session:   firstNonEmpty(*session, os.Getenv("SESH_SESSION")),
+		SessionID: *sessionID,
+		NATSURL:   shim.ReadNATSURL(*natsURL),
+		Outfit:    firstNonEmpty(*outfit, os.Getenv("ORCH_OUTFIT")),
+		Role:      firstNonEmpty(*role, os.Getenv("ORCH_ROLE")),
+		CWD:       firstNonEmpty(*cwd, resolveCWD(*pane)),
+		Interval:  *interval,
+		TaskID:    firstNonEmpty(*taskID, os.Getenv("ORCH_TASK_ID")),
 	}
 
-	a, err := buildAdapter(*agent, *pane, cfg.CWD)
+	a, err := buildAdapter(*agent, *pane, cfg.CWD, cfg.SessionID)
 	if err != nil {
 		return err
 	}
@@ -94,24 +97,30 @@ func run() error {
 	return shim.Run(ctx, cfg)
 }
 
-func buildAdapter(agent, pane, cwd string) (shim.Adapter, error) {
+func buildAdapter(agent, pane, cwd, sessionID string) (shim.Adapter, error) {
 	switch agent {
 	case "claude-code", "claude":
 		// Normalize: accept both "claude" (orch-spawn arg) and the
 		// canonical "claude-code" (Synadia §C identifier).
-		return claudecode.New(pane, cwd), nil
+		cc := claudecode.New(pane, cwd)
+		cc.SessionID = sessionID
+		return cc, nil
 	case "codex":
 		// codex adapter: tails ~/.codex/sessions rollout JSONL, watches the
 		// orch-stop marker, and emits synthetic query chunks on idle detection.
+		// SessionID flag does NOT apply yet (issue #11 follow-up PR).
 		return codex.New(pane), nil
 	case "gemini":
 		// gemini-cli adapter. Uses AfterAgent (NOT Stop) for turn-end
 		// detection; native Notification events for query chunks.
 		// CWD is not used in v1 (transcript-path deferral — see
 		// internal/adapter/gemini/gemini.go TODO comment).
+		// SessionID flag does NOT apply yet (issue #11 follow-up PR).
 		return gemini.New(pane), nil
 	case "pi":
-		return pi.New(pane, cwd), nil
+		p := pi.New(pane, cwd)
+		p.SessionID = sessionID
+		return p, nil
 	case "echo":
 		// echo is the reference adapter: no external tooling required.
 		// Use for smoke tests, protocol demonstrations, and as a template
