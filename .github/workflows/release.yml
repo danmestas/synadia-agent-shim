@@ -28,3 +28,38 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-npm:
+    name: publish to npm
+    needs: goreleaser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: sync package.json version from tag
+        run: |
+          # Strip leading 'v' from the tag (e.g. v1.0.0 -> 1.0.0) and
+          # rewrite package.json in place. This is a release-time mutation
+          # only — never committed back to main.
+          tag="${{ github.ref_name }}"
+          version="${tag#v}"
+          node -e "
+            const fs = require('node:fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.version = process.argv[1];
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          " "$version"
+          echo "package.json version synced to $version"
+          node -e "console.log(require('./package.json').version)"
+
+      - name: npm publish
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
