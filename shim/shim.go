@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -61,6 +62,23 @@ const defaultSignalPrefix = "orch.signal"
 // Default heartbeat cadence (§8.2). Recommended 30s. We expose the
 // override via Config.Interval and clamp the lower bound to 1s.
 const defaultInterval = 30 * time.Second
+
+// instanceIDPattern is the validation regex for Config.InstanceID — the
+// human-readable worker slug that, when set, drives the slug-keyed
+// subject track (issue #19, orch#181). Subject-safe set: ASCII letters,
+// digits, dot, underscore, hyphen. Length 1-128 keeps subjects bounded
+// and rejects pathological inputs early. Empty InstanceID disables the
+// slug track entirely (back-compat with pre-#19 spawners).
+var instanceIDPattern = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,128}$`)
+
+// EnvSlugDualPublish is the env var that gates whether the shim
+// continues publishing on legacy pct-keyed subjects in addition to the
+// slug-keyed subjects when Config.InstanceID is set. "1" (default) keeps
+// the legacy track on during the dual-publish window so existing
+// subscribers don't break; "0" publishes ONLY on the slug-keyed track
+// (for benches that want a clean wire). When InstanceID is empty this
+// var has no effect — the shim always publishes the legacy track.
+const EnvSlugDualPublish = "ORCH_SLUG_DUAL_PUBLISH"
 
 // terminatorWatchdog bounds how long the shim waits for the adapter's
 // §6.5 zero-body terminator after emitting the §6.4 ack. If the adapter
@@ -110,6 +128,26 @@ type Config struct {
 	// metadata.session and the heartbeat payload (§8.3) — and per
 	// §3.2 marks the agent as "session-aware". Empty = omitted.
 	Session string
+
+	// InstanceID is the human-readable worker slug (issue #19 / orch#181).
+	// When non-empty, the shim:
+	//
+	//   - includes `instance_id: "<slug>"` in $SRV.INFO metadata
+	//     alongside the existing `pane_id`,
+	//   - registers a SECOND prompt + status endpoint subscribed on
+	//     slug-keyed subjects: agents.{prompt,status}.<token>.<owner>.<slug>,
+	//   - publishes heartbeats on the slug-keyed subject too:
+	//     agents.hb.<token>.<owner>.<slug>.
+	//
+	// Whether the legacy pct-keyed track stays live alongside the slug
+	// track is gated by env var ORCH_SLUG_DUAL_PUBLISH (default "1" =
+	// on, both tracks; "0" = slug-only). When InstanceID is empty the
+	// shim runs as before — legacy pct-keyed track only, regardless of
+	// the env var. See issue #19 for the dual-publish window rationale.
+	//
+	// Validated against [a-zA-Z0-9._-]{1,128}. Rejected at startup in
+	// Config.validate so a typo'd slug fails loud, not at first publish.
+	InstanceID string
 
 	// NATSURL is the bus to dial. Resolution order in main.go:
 	// flag → $NATS_URL → ~/.sesh/hub.nats.url
@@ -300,7 +338,42 @@ func (c Config) validate() error {
 	if c.Adapter == nil {
 		return errors.New("adapter is required")
 	}
+	// Issue #19 / orch#181: validate the human-readable slug at startup
+	// so a typo fails loud here rather than producing a subscription
+	// with a NATS-illegal subject token later. Empty InstanceID is
+	// allowed (back-compat: pre-#19 spawners don't pass the flag).
+	if c.InstanceID != "" && !instanceIDPattern.MatchString(c.InstanceID) {
+		return fmt.Errorf(
+			"instance_id %q invalid: must match %s",
+			c.InstanceID, instanceIDPattern.String(),
+		)
+	}
 	return nil
+}
+
+// slugDualPublishLegacy returns true when the shim should keep
+// publishing on the legacy pct-keyed subjects alongside the slug-keyed
+// subjects. Only consulted when Config.InstanceID is non-empty —
+// callers without a slug always get the legacy track regardless.
+//
+// Env var ORCH_SLUG_DUAL_PUBLISH:
+//
+//	unset or "1" → legacy on (default; safe during the rollout window)
+//	"0"          → slug-only (clean wire, for benches)
+//
+// Any other value is treated as "1" with a one-line warning so a typo
+// doesn't silently surprise the operator into the wrong mode.
+func slugDualPublishLegacy() bool {
+	v := os.Getenv(EnvSlugDualPublish)
+	switch v {
+	case "", "1":
+		return true
+	case "0":
+		return false
+	default:
+		log.Printf("shim: %s=%q not recognised (want 0 or 1); defaulting to dual-publish on", EnvSlugDualPublish, v)
+		return true
+	}
 }
 
 func currentOwner() string {
@@ -374,6 +447,16 @@ type shim struct {
 	// on stop() so a shim restart on the same connection doesn't double-
 	// dispatch signals.
 	signalSub *nats.Subscription
+
+	// publishLegacy captures the once-at-start decision of whether the
+	// shim publishes heartbeats on the legacy pct-keyed subject (and
+	// subscribes legacy prompt/status endpoints). Resolved from
+	// Config.InstanceID + the ORCH_SLUG_DUAL_PUBLISH env var inside
+	// start(). True when no slug is set (back-compat) OR a slug is set
+	// AND the env var is on (default). False only in the explicit
+	// slug-only mode (InstanceID set + env var = "0"). Read on every
+	// heartbeat tick; written once. See issue #19.
+	publishLegacy bool
 }
 
 // loadActiveReply returns the current active reply subject or "" if idle.
@@ -430,6 +513,37 @@ func (s *shim) heartbeatSubject() string {
 		s.cfg.SubjectPrefix, s.cfg.AgentToken, s.cfg.Owner, s.sessionToken())
 }
 
+// slugPromptSubject returns the slug-keyed prompt subject (issue #19):
+//
+//	<SubjectPrefix>.prompt.<token>.<owner>.<InstanceID>
+//
+// Only meaningful when Config.InstanceID is non-empty; callers MUST
+// guard before using the result. Returns "" when no slug is set so an
+// accidental publish/subscribe fails loudly at the NATS layer.
+func (s *shim) slugPromptSubject() string {
+	if s.cfg.InstanceID == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s.prompt.%s.%s.%s",
+		s.cfg.SubjectPrefix, s.cfg.AgentToken, s.cfg.Owner, s.cfg.InstanceID)
+}
+
+func (s *shim) slugStatusSubject() string {
+	if s.cfg.InstanceID == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s.status.%s.%s.%s",
+		s.cfg.SubjectPrefix, s.cfg.AgentToken, s.cfg.Owner, s.cfg.InstanceID)
+}
+
+func (s *shim) slugHeartbeatSubject() string {
+	if s.cfg.InstanceID == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s.hb.%s.%s.%s",
+		s.cfg.SubjectPrefix, s.cfg.AgentToken, s.cfg.Owner, s.cfg.InstanceID)
+}
+
 // signalSubject is the wildcard the shim subscribes to for
 // <SignalPrefix>.> dispatch. The verb (interrupt|redirect|...) is the
 // wildcard token; the identity tuple (token/owner/pane-enc) pins
@@ -457,28 +571,71 @@ func (s *shim) start() error {
 	}
 	s.svc = svc
 
-	// §12 requires both endpoints. Subject is agent-chosen — we use the
-	// channel-plugin default layout from §2.3.
-	if err := svc.AddEndpoint("prompt",
-		micro.HandlerFunc(s.handlePrompt),
-		micro.WithEndpointSubject(s.promptSubject()),
-		micro.WithEndpointQueueGroup(s.cfg.SubjectPrefix),
-		micro.WithEndpointMetadata(map[string]string{
-			"max_payload":    defaultMaxPayload,
-			"attachments_ok": strconv.FormatBool(defaultAttachmentsOK),
-		}),
-	); err != nil {
-		_ = svc.Stop()
-		return fmt.Errorf("shim: prompt endpoint: %w", err)
+	// Endpoint registration plan (issue #19):
+	//
+	//   InstanceID == ""                          → legacy only (back-compat)
+	//   InstanceID set, ORCH_SLUG_DUAL_PUBLISH=1  → legacy + slug
+	//   InstanceID set, ORCH_SLUG_DUAL_PUBLISH=0  → slug only
+	//
+	// Both endpoints share the same handlers; the only thing that
+	// changes is which subject(s) deliver into them. We compute
+	// publishLegacy once here so the heartbeat loop reads the same
+	// resolved decision (stored on the shim) rather than re-reading the
+	// env var on each tick — env vars don't change at runtime and
+	// re-reading would only invite test flakes from concurrent setenv.
+	s.publishLegacy = s.cfg.InstanceID == "" || slugDualPublishLegacy()
+	promptMeta := map[string]string{
+		"max_payload":    defaultMaxPayload,
+		"attachments_ok": strconv.FormatBool(defaultAttachmentsOK),
 	}
 
-	if err := svc.AddEndpoint("status",
-		micro.HandlerFunc(s.handleStatus),
-		micro.WithEndpointSubject(s.statusSubject()),
-		micro.WithEndpointQueueGroup(s.cfg.SubjectPrefix),
-	); err != nil {
-		_ = svc.Stop()
-		return fmt.Errorf("shim: status endpoint: %w", err)
+	if s.publishLegacy {
+		// §12 requires prompt + status endpoints. Subject is agent-chosen
+		// — we use the channel-plugin default layout from §2.3.
+		if err := svc.AddEndpoint("prompt",
+			micro.HandlerFunc(s.handlePrompt),
+			micro.WithEndpointSubject(s.promptSubject()),
+			micro.WithEndpointQueueGroup(s.cfg.SubjectPrefix),
+			micro.WithEndpointMetadata(promptMeta),
+		); err != nil {
+			_ = svc.Stop()
+			return fmt.Errorf("shim: prompt endpoint: %w", err)
+		}
+
+		if err := svc.AddEndpoint("status",
+			micro.HandlerFunc(s.handleStatus),
+			micro.WithEndpointSubject(s.statusSubject()),
+			micro.WithEndpointQueueGroup(s.cfg.SubjectPrefix),
+		); err != nil {
+			_ = svc.Stop()
+			return fmt.Errorf("shim: status endpoint: %w", err)
+		}
+	}
+
+	// Slug-keyed endpoints: only registered when InstanceID is set.
+	// Distinct endpoint names ("prompt_slug" / "status_slug") so micro
+	// doesn't see them as conflicting registrations of the same name.
+	// Queue group is still <SubjectPrefix> — the §3.3 sharding semantics
+	// don't care about the endpoint name, only the queue group label.
+	if s.cfg.InstanceID != "" {
+		if err := svc.AddEndpoint("prompt_slug",
+			micro.HandlerFunc(s.handlePrompt),
+			micro.WithEndpointSubject(s.slugPromptSubject()),
+			micro.WithEndpointQueueGroup(s.cfg.SubjectPrefix),
+			micro.WithEndpointMetadata(promptMeta),
+		); err != nil {
+			_ = svc.Stop()
+			return fmt.Errorf("shim: prompt_slug endpoint: %w", err)
+		}
+
+		if err := svc.AddEndpoint("status_slug",
+			micro.HandlerFunc(s.handleStatus),
+			micro.WithEndpointSubject(s.slugStatusSubject()),
+			micro.WithEndpointQueueGroup(s.cfg.SubjectPrefix),
+		); err != nil {
+			_ = svc.Stop()
+			return fmt.Errorf("shim: status_slug endpoint: %w", err)
+		}
 	}
 
 	// Bind the adapter's background watchers to the shim's lifetime
@@ -535,6 +692,13 @@ func (s *shim) serviceMetadata() map[string]string {
 	}
 	if s.cfg.CWD != "" {
 		m["cwd"] = s.cfg.CWD
+	}
+	// Issue #19: the human-readable slug lands in metadata.instance_id
+	// alongside (not replacing) pane_id. Operators discovering shims
+	// via $SRV.INFO.agents can filter by instance_id; pane_id is still
+	// what pane-watchdog and tmux-send-keys consumers key on.
+	if s.cfg.InstanceID != "" {
+		m["instance_id"] = s.cfg.InstanceID
 	}
 	return m
 }
@@ -593,12 +757,24 @@ func (s *shim) publishHeartbeat() {
 	}
 	// Heartbeats are not part of any prompt's trace; mint fresh.
 	hdr := envelopeHeaders(s.cfg.Role, s.cfg.TaskID, "", firstAttempt)
-	msg := &nats.Msg{
-		Subject: s.heartbeatSubject(),
-		Header:  hdr,
-		Data:    body,
+	// Issue #19: legacy track is published when publishLegacy is set
+	// (always when no slug; when a slug is set, only when
+	// ORCH_SLUG_DUAL_PUBLISH != "0"). Each subject is a distinct NATS
+	// publish — subscribers on either track see exactly one copy.
+	if s.publishLegacy {
+		_ = s.nc.PublishMsg(&nats.Msg{
+			Subject: s.heartbeatSubject(),
+			Header:  hdr,
+			Data:    body,
+		})
 	}
-	_ = s.nc.PublishMsg(msg)
+	if s.cfg.InstanceID != "" {
+		_ = s.nc.PublishMsg(&nats.Msg{
+			Subject: s.slugHeartbeatSubject(),
+			Header:  hdr,
+			Data:    body,
+		})
+	}
 }
 
 // heartbeatPayload is the wire shape from §8.3. snake_case keys match

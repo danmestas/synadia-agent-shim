@@ -48,10 +48,44 @@ Resolution order (most explicit wins):
 | NATS URL | `--nats` → `$NATS_URL` → `~/.sesh/hub.url` → `nats://127.0.0.1:4222` |
 | Owner | `--owner` → `$ORCH_OWNER` → `$USER` → `/etc/passwd` lookup |
 | Session | `--session` → `$SESH_SESSION` → omitted from metadata |
+| Instance ID | `--instance-id` → omitted (no slug-keyed subjects) |
 | CWD | `--cwd` → `tmux display-message -p '#{pane_current_path}'` |
 
 The shim exits when the bound pane dies (SIGCHLD from the parent
 shell). `orch-spawn` backstops this by `wait`-ing on a sentinel pid.
+
+### `--instance-id`
+
+`--instance-id <slug>` attaches a human-readable worker identity to the
+shim. Subject-safe charset `[a-zA-Z0-9._-]`, length 1-128 — invalid
+slugs are rejected at startup so a typo fails loud, not at first publish.
+
+When set, the shim:
+
+1. Adds `instance_id: "<slug>"` to `$SRV.INFO.agents` metadata
+   alongside the existing `pane_id`. Discovery tools can filter by
+   either; `pane_id` stays so pane-watchdog and `tmux send-keys`
+   consumers keep working.
+2. Registers a SECOND prompt + status endpoint on the slug-keyed
+   subjects:
+   - `agents.prompt.<token>.<owner>.<slug>`
+   - `agents.status.<token>.<owner>.<slug>`
+3. Publishes heartbeats on the slug-keyed subject too:
+   - `agents.hb.<token>.<owner>.<slug>`
+
+Dual-publish is gated by env var `ORCH_SLUG_DUAL_PUBLISH`:
+
+| Value | Behavior (with `--instance-id` set) |
+| --- | --- |
+| unset / `1` | legacy `pct<N>` track + slug track both live (default — safe during rollout) |
+| `0` | slug track only; legacy `pct<N>` subjects have no subscriber |
+
+When `--instance-id` is **not** set, the shim runs as before — only the
+legacy `pct<N>`-keyed track is registered, regardless of the env var.
+
+The dual-publish window is intended to last **two releases**; the
+legacy `pct<N>` track will be retired in a follow-up issue. Track the
+deprecation in `CHANGELOG.md`.
 
 ## Usage (Go SDK)
 
