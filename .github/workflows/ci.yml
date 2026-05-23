@@ -70,3 +70,20 @@ jobs:
           distribution: goreleaser
           version: '~> v2'
           args: check
+
+  npm-publish-dry-run:
+    name: npm publish dry-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: npm publish --dry-run
+        # Catches packaging issues (missing files in `files:`, broken
+        # `bin/` references, etc.) before a tag push triggers a real
+        # publish. No NODE_AUTH_TOKEN — dry-run doesn't authenticate.
+        run: npm publish --dry-run --access public

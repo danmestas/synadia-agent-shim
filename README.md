@@ -157,6 +157,28 @@ shim type-asserts and calls `Abort` on `orch.signal.interrupt` arrival.
 
 The `Adapter` and `Config` shapes are frozen at v1.
 
+## Releasing
+
+Releases are tag-driven. Pushing an annotated tag `vX.Y.Z` triggers
+`.github/workflows/release.yml`:
+
+1. `goreleaser` builds platform archives + creates the GitHub Release.
+2. `publish-npm` syncs `package.json` version from the tag, then runs
+   `npm publish --access public`.
+
+To cut a release:
+
+```sh
+git tag vX.Y.Z
+git push --tags
+```
+
+One-time operator setup: set the `NPM_TOKEN` secret in the repo's
+GitHub settings (Settings → Secrets → Actions) with an npm automation
+token that has publish access to `@agent-ops/synadia-agent-shim`.
+PRs run `npm publish --dry-run` in CI to catch packaging breakage
+before a tag is pushed.
+
 ## Wire surface
 
 - Service name: `<SubjectPrefix>` (default `agents`), per Synadia §3.1
