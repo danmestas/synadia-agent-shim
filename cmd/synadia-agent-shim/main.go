@@ -5,14 +5,16 @@
 // Usage:
 //
 //	orch-agent-shim --agent claude-code --pane %37
+//	orch-agent-shim --agent claude-code --pane %37 --instance-id ce-worker
 //
 // Resolution order (most explicit wins):
 //
-//	NATS URL: --nats flag → $NATS_URL → ~/.sesh/hub.nats.url
-//	          → ~/.sesh/hub.url (legacy, deprecated) → nats://127.0.0.1:4222
-//	Owner:    --owner flag → $ORCH_OWNER → $USER → /etc/passwd lookup
-//	Session:  --session flag → $SESH_SESSION → "" (omitted from metadata)
-//	CWD:      --cwd flag → tmux display-message -p '#{pane_current_path}'
+//	NATS URL:    --nats flag → $NATS_URL → ~/.sesh/hub.nats.url
+//	             → ~/.sesh/hub.url (legacy, deprecated) → nats://127.0.0.1:4222
+//	Owner:       --owner flag → $ORCH_OWNER → $USER → /etc/passwd lookup
+//	Session:     --session flag → $SESH_SESSION → "" (omitted from metadata)
+//	CWD:         --cwd flag → tmux display-message -p '#{pane_current_path}'
+//	Instance ID: --instance-id flag → "" (no slug-keyed subjects)
 //
 // Lifetime: process exits when the pane it's bound to dies (SIGCHLD
 // from the parent shell does the right thing under most spawn setups;
@@ -59,6 +61,7 @@ func run() error {
 		interval          = flag.Duration("interval", 30*time.Second, "heartbeat interval")
 		paneWatchInterval = flag.Duration("pane-watch-interval", 30*time.Second, "how often to poll tmux to see if the bound pane is still alive; empty --pane disables the watchdog")
 		taskID            = flag.String("task-id", "", "Sesh-Task-Id envelope header (default $ORCH_TASK_ID, empty omits header)")
+		instanceID        = flag.String("instance-id", "", "human-readable worker slug; when set, shim adds metadata.instance_id, registers slug-keyed prompt/status endpoints (agents.{prompt,status}.<token>.<owner>.<slug>), and publishes heartbeats on the slug-keyed hb subject. Legacy pct-keyed track stays live unless ORCH_SLUG_DUAL_PUBLISH=0. Must match [a-zA-Z0-9._-]{1,128}.")
 	)
 	flag.Parse()
 
@@ -72,6 +75,7 @@ func run() error {
 		Pane:              *pane,
 		Owner:             firstNonEmpty(*owner, os.Getenv("ORCH_OWNER"), os.Getenv("USER")),
 		Session:           firstNonEmpty(*session, os.Getenv("SESH_SESSION")),
+		InstanceID:        *instanceID,
 		NATSURL:           shim.ReadNATSURL(*natsURL),
 		Outfit:            firstNonEmpty(*outfit, os.Getenv("ORCH_OUTFIT")),
 		Role:              firstNonEmpty(*role, os.Getenv("ORCH_ROLE")),
