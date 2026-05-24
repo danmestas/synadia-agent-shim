@@ -38,21 +38,69 @@ go get github.com/danmestas/synadia-agent-shim/adapter/echo
 ## Usage (CLI)
 
 ```sh
-synadia-agent-shim --agent claude-code --pane %37
+synadia-agent-shim --agent claude-code --locator tmux:%37
+synadia-agent-shim --agent claude-code --locator cmux:surface:30
+synadia-agent-shim --agent claude-code --locator zmx:engineer-a
+synadia-agent-shim --agent claude-code --pane %37     # deprecated alias for --locator tmux:%37
 ```
 
 Resolution order (most explicit wins):
 
 | Setting | Source |
 | --- | --- |
-| NATS URL | `--nats` → `$NATS_URL` → `~/.sesh/hub.url` → `nats://127.0.0.1:4222` |
+| NATS URL | `--nats` → `$NATS_URL` → `~/.sesh/hub.nats.url` → `nats://127.0.0.1:4222` |
 | Owner | `--owner` → `$ORCH_OWNER` → `$USER` → `/etc/passwd` lookup |
 | Session | `--session` → `$SESH_SESSION` → omitted from metadata |
 | Instance ID | `--instance-id` → omitted (no slug-keyed subjects) |
 | CWD | `--cwd` → `tmux display-message -p '#{pane_current_path}'` |
+| Locator | `--locator` → `--pane` (deprecated; infers `tmux:`) → autodetect via `$CMUX_SURFACE_ID` / `$ZMX_SESSION` / `$TMUX_PANE` |
 
 The shim exits when the bound pane dies (SIGCHLD from the parent
 shell). `orch-spawn` backstops this by `wait`-ing on a sentinel pid.
+The pane-watchdog (`tmux display-message` poll) currently only runs
+under the tmux engine; cmux and zmx manage surface lifetime themselves.
+
+### Engine support matrix
+
+The shim dispatches the inbound-prompt send-verb based on the
+persistence engine it's running under. The engine is detected from
+env vars at startup, or set explicitly via `--locator`.
+
+| Engine | Detection (env) | Locator form | Send verb | Interrupt verb |
+| --- | --- | --- | --- | --- |
+| `tmux` | `$TMUX_PANE` (preferred) or `$TMUX` | `tmux:%37` | `tmux send-keys -l -t %37 <text>` + `tmux send-keys -t %37 Enter` | `tmux send-keys -t %37 C-c` |
+| `cmux` | `$CMUX_SURFACE_ID` | `cmux:surface:30` or `cmux:<UUID>` | `cmux send --surface <ref> -- <text>\n` | `cmux send-key --surface <ref> ctrl+c` |
+| `zmx` | `$ZMX_SESSION` | `zmx:engineer-a` | `zmx send <session> <text>\r` | `zmx send <session> $'\x03'` |
+
+Detection precedence: cmux → zmx → tmux (most-specific first; cmux and
+zmx pane environments sometimes also expose `$TMUX`, so engine-specific
+markers win).
+
+Heartbeats and `$SRV.INFO.agents` metadata publish both the new
+`engine` and `locator` fields alongside the back-compat `pane_id`:
+
+```json
+{
+  "metadata": {
+    "agent": "claude-code",
+    "owner": "tester",
+    "pane_id": "surface:30",
+    "engine": "cmux",
+    "locator": "cmux:surface:30"
+  }
+}
+```
+
+`pane_id` will be retired once downstream registry consumers
+(orch-registry) adopt `locator`. The dual surface mirrors the
+`--instance-id` dual-publish window.
+
+### `--pane` deprecation
+
+`--pane VALUE` continues to work and is interpreted as
+`--locator tmux:VALUE`, with a one-line stderr deprecation notice on
+startup. It will be removed in the **next** shim release (see
+`CHANGELOG.md`). Callers should migrate to `--locator`.
 
 ### `--instance-id`
 

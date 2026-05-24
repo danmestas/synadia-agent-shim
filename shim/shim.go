@@ -119,7 +119,26 @@ type Config struct {
 	// Pane is the raw tmux pane id (e.g. "%37"). It's preserved
 	// verbatim in metadata.pane_id; the subject-safe form is derived
 	// via encodePane.
+	//
+	// Engine-agnostic note (added with the engine-aware-send PR):
+	// callers using cmux or zmx still populate this field with a
+	// best-effort surface identifier so the subject-token derivation
+	// (encodePane) has something to work with — cmux surface refs and
+	// zmx session names both fit the existing token slot. The typed
+	// engine-native identifier lives in Locator below; Pane is the
+	// back-compat string that orch's current registry reads.
 	Pane string
+
+	// Locator is the engine-aware target identifier (engine.go). When
+	// non-empty, the send dispatch (LocatorSendKeys) routes to the
+	// engine-native verb (tmux send-keys / cmux send / zmx send). When
+	// empty, Run autodetects from environment variables via
+	// DetectEngine; failure to detect is a fatal startup error.
+	//
+	// Published in $SRV.INFO metadata as `locator` (typed form
+	// "engine:value") and `engine` (engine identifier alone) alongside
+	// the existing back-compat `pane_id` field.
+	Locator Locator
 
 	// Owner is the operator identifier. Defaults to $USER.
 	Owner string
@@ -275,7 +294,17 @@ func RunWithConn(ctx context.Context, nc *nats.Conn, cfg Config) error {
 	// No-op when cfg.Pane == "" (echo adapter, CI, conformance suite).
 	// nil check = production paneAliveTmux. See docs in shim/pane.go
 	// and paired orch issue #167.
-	go watchPane(runCtx, cfg.Pane, cfg.PaneWatchInterval, nil, cancel)
+	//
+	// Engine-aware: the watchdog still only knows tmux today. For
+	// cmux/zmx workers we skip the watchdog rather than mis-poll with
+	// `tmux display-message` against a non-tmux surface — the cmux app
+	// and zmx daemon manage surface lifetime themselves, and the
+	// shim's exit-on-pane-death backstop here is only a tmux concern
+	// (orch issue #167 was tmux-specific). A future cmux/zmx-native
+	// watchdog can plug in via the paneAliveCheck seam.
+	if cfg.Locator.Engine == EngineTmux {
+		go watchPane(runCtx, cfg.Pane, cfg.PaneWatchInterval, nil, cancel)
+	}
 
 	<-runCtx.Done()
 	return nil
@@ -325,6 +354,40 @@ func withDefaults(cfg Config) Config {
 	if cfg.PaneWatchInterval <= 0 {
 		cfg.PaneWatchInterval = defaultPaneWatchInterval
 	}
+	// Engine-aware send dispatch (engine.go). Resolution precedence
+	// (highest wins):
+	//
+	//   1. Caller-supplied Locator (--locator flag or explicit field).
+	//   2. Pane non-empty (--pane back-compat or pre-engine-aware
+	//      caller): synthesize tmux:<Pane>. The Pane field is the
+	//      legacy explicit signal and MUST override env-var sniffing,
+	//      otherwise a shim launched inside a cmux/zmx host but bound
+	//      to a tmux pane (operator inception, "cmux running an
+	//      embedded tmux pane") routes to the wrong engine.
+	//   3. Environment-variable autodetect (DetectEngine).
+	//
+	// Failure to resolve here is non-fatal at withDefaults time —
+	// validate() turns an unresolved locator into a clear startup
+	// error so the operator sees "no engine detected" with the
+	// supported list, not "tmux: command not found" on first send.
+	if !cfg.Locator.IsValid() {
+		if cfg.Pane != "" {
+			cfg.Locator = Locator{Engine: EngineTmux, Value: cfg.Pane}
+		} else if loc, ok := DetectEngine(nil); ok && loc.IsValid() {
+			cfg.Locator = loc
+		}
+	}
+	// Reciprocal back-compat: when the caller resolved a Locator via
+	// --locator or autodetect but didn't populate Pane (cmux/zmx
+	// spawners that never set --pane), mirror the locator value into
+	// Pane so downstream tmux-shaped consumers (metadata.pane_id, the
+	// subject-token derivation, the pane-watchdog when applicable) have
+	// something. For non-tmux engines this is a best-effort identifier,
+	// not a tmux pane id — orch's registry can match on it; the
+	// pane-watchdog short-circuits on non-tmux engines (see below).
+	if cfg.Pane == "" && cfg.Locator.IsValid() {
+		cfg.Pane = cfg.Locator.Value
+	}
 	return cfg
 }
 
@@ -332,11 +395,26 @@ func (c Config) validate() error {
 	if c.Agent == "" {
 		return errors.New("agent is required")
 	}
-	if c.Pane == "" {
-		return errors.New("pane is required")
-	}
 	if c.Adapter == nil {
 		return errors.New("adapter is required")
+	}
+	// Engine-aware send dispatch (engine.go) needs a known engine.
+	// Three resolution sources, in order:
+	//
+	//   1. c.Locator set explicitly by the caller (--locator flag).
+	//   2. c.Pane non-empty: synthesize tmux:<Pane> (legacy --pane).
+	//   3. withDefaults autodetected one from env vars.
+	//
+	// validate() can run before withDefaults (direct unit-test callers
+	// do exactly this), so case 2 must also be reachable from here:
+	// accept a Pane-only Config as the legacy tmux path.
+	//
+	// Note: the legacy "pane is required" check is folded into this
+	// check — the modern equivalent is "we need SOMETHING to know
+	// where to route prompts," and either Pane or Locator satisfies
+	// that.
+	if !c.Locator.IsValid() && c.Pane == "" {
+		return fmt.Errorf("locator unresolved: pass --locator (tmux|cmux|zmx):<value> or --pane <id> (deprecated; tmux only), or run inside a tmux/cmux/zmx session (env vars: TMUX_PANE, CMUX_SURFACE_ID, ZMX_SESSION)")
 	}
 	// Issue #19 / orch#181: validate the human-readable slug at startup
 	// so a typo fails loud here rather than producing a subscription
@@ -700,6 +778,21 @@ func (s *shim) serviceMetadata() map[string]string {
 	if s.cfg.InstanceID != "" {
 		m["instance_id"] = s.cfg.InstanceID
 	}
+	// Engine-aware send dispatch (engine.go): publish the typed
+	// locator + engine identifier alongside the legacy pane_id so
+	// downstream registry readers can adopt them at their own pace.
+	// Field semantics:
+	//
+	//   engine   →  "tmux" | "cmux" | "zmx"
+	//   locator  →  "<engine>:<value>" (e.g. "cmux:surface:30")
+	//
+	// pane_id stays as-is for back-compat — orch's current registry
+	// keys on it. Once consumers adopt `locator`, pane_id can be
+	// retired in a future shim release.
+	if s.cfg.Locator.IsValid() {
+		m["engine"] = string(s.cfg.Locator.Engine)
+		m["locator"] = s.cfg.Locator.String()
+	}
 	return m
 }
 
@@ -747,6 +840,14 @@ func (s *shim) buildHeartbeat() heartbeatPayload {
 	if s.cfg.Session != "" {
 		p.Session = s.cfg.Session
 	}
+	// Engine-aware send dispatch (engine.go). Heartbeats publish the
+	// engine + typed locator so consumers building topology views (orch
+	// registry, dashboards) can render the worker's surface natively
+	// instead of guessing from pane_id.
+	if s.cfg.Locator.IsValid() {
+		p.Engine = string(s.cfg.Locator.Engine)
+		p.Locator = s.cfg.Locator.String()
+	}
 	return p
 }
 
@@ -779,6 +880,11 @@ func (s *shim) publishHeartbeat() {
 
 // heartbeatPayload is the wire shape from §8.3. snake_case keys match
 // the on-wire form; the struct is also used by the §8.7 status handler.
+//
+// Engine + Locator added with the engine-aware-send PR; both are
+// omitempty for back-compat with subscribers built against the pre-PR
+// payload shape. Once orch's registry adopts them, the omitempty can
+// be removed in a future minor version.
 type heartbeatPayload struct {
 	Agent      string `json:"agent"`
 	Owner      string `json:"owner"`
@@ -786,6 +892,8 @@ type heartbeatPayload struct {
 	InstanceID string `json:"instance_id"`
 	TS         string `json:"ts"`
 	IntervalS  int    `json:"interval_s"`
+	Engine     string `json:"engine,omitempty"`
+	Locator    string `json:"locator,omitempty"`
 }
 
 // handleStatus implements §8.7 — request body ignored, reply is a
