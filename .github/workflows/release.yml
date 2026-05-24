@@ -71,3 +71,50 @@ jobs:
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  smoke:
+    name: post-publish smoke
+    # Catches install-time regressions (missing bin entries, broken shebangs,
+    # missing files in the published tarball) that npm publish itself accepts
+    # but post-install execution fails on. Orch shipped v0.2.0 / v0.2.1 / v0.2.2
+    # with this exact failure class — this job exists so shim never does.
+    #
+    # Skip on workflow_dispatch dry-run invocations (if/when one is added).
+    # Tag pushes always run this.
+    if: ${{ github.event_name == 'push' || inputs.dry_run != true }}
+    needs: publish-npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: install just-published package
+        # Tag pushes set GITHUB_REF_NAME to the tag (e.g. v0.2.3); strip the leading v.
+        # workflow_dispatch on a branch falls back to the latest version on the registry.
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION=$(curl -s https://registry.npmjs.org/@agent-ops/synadia-agent-shim/latest | jq -r .version)
+          fi
+          echo "installing @agent-ops/synadia-agent-shim@$VERSION"
+          # Retry up to 5 times in case of registry propagation lag.
+          for i in 1 2 3 4 5; do
+            if npm install -g "@agent-ops/synadia-agent-shim@$VERSION"; then break; fi
+            echo "install attempt $i failed; sleeping 10s and retrying..."
+            sleep 10
+          done
+          npm list -g --depth=0 | grep '@agent-ops/synadia-agent-shim' || (echo "package not installed" && exit 1)
+
+      - name: bin shim probe
+        # Proves every declared bin entry actually resolves on PATH and is executable.
+        run: |
+          set -e
+          for cmd in synadia-agent-shim orch-agent-shim; do
+            which "$cmd"
+          done
+
+      - name: smoke — synadia-agent-shim --help
+        # Proves the binary loads and prints its help text.
+        run: synadia-agent-shim --help
