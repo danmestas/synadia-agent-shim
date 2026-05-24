@@ -8,6 +8,14 @@ on:
 permissions:
   contents: write
 
+# Queueing-only concurrency on release: if two tag pushes arrive close
+# together, run them in order rather than racing for the same GitHub
+# Release / npm publish. cancel-in-progress is intentionally false —
+# we never want to kill a halfway-done deploy.
+concurrency:
+  group: release-${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
