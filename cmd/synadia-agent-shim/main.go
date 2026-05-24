@@ -4,8 +4,10 @@
 //
 // Usage:
 //
-//	orch-agent-shim --agent claude-code --pane %37
-//	orch-agent-shim --agent claude-code --pane %37 --instance-id ce-worker
+//	orch-agent-shim --agent claude-code --locator tmux:%37
+//	orch-agent-shim --agent claude-code --locator cmux:surface:30
+//	orch-agent-shim --agent claude-code --locator zmx:engineer-a
+//	orch-agent-shim --agent claude-code --pane %37             # deprecated; tmux only
 //
 // Resolution order (most explicit wins):
 //
@@ -15,6 +17,8 @@
 //	Session:     --session flag → $SESH_SESSION → "" (omitted from metadata)
 //	CWD:         --cwd flag → tmux display-message -p '#{pane_current_path}'
 //	Instance ID: --instance-id flag → "" (no slug-keyed subjects)
+//	Locator:     --locator → autodetect ($CMUX_SURFACE_ID, $ZMX_SESSION,
+//	             $TMUX_PANE) → --pane (deprecated, infers tmux:)
 //
 // Lifetime: process exits when the pane it's bound to dies (SIGCHLD
 // from the parent shell does the right thing under most spawn setups;
@@ -51,7 +55,8 @@ func main() {
 func run() error {
 	var (
 		agent             = flag.String("agent", "", "agent harness name — required (claude-code in v1; codex/pi/gemini to come in Plans 11-13)")
-		pane              = flag.String("pane", "", "tmux pane id (e.g. %37) — required")
+		pane              = flag.String("pane", "", "DEPRECATED: tmux pane id (e.g. %37). Use --locator tmux:%37 instead. Will be removed in the next shim release.")
+		locator           = flag.String("locator", "", "engine-aware surface locator (TYPE:VALUE). Examples: tmux:%37 | cmux:surface:30 | zmx:engineer-a. Default: autodetect via $CMUX_SURFACE_ID, $ZMX_SESSION, or $TMUX_PANE.")
 		owner             = flag.String("owner", "", "owner override (default $ORCH_OWNER or $USER)")
 		session           = flag.String("session", "", "session label override (default $SESH_SESSION)")
 		natsURL           = flag.String("nats", "", "NATS URL override (default $NATS_URL or ~/.sesh/hub.nats.url; legacy ~/.sesh/hub.url is read as a deprecated fallback)")
@@ -65,27 +70,42 @@ func run() error {
 	)
 	flag.Parse()
 
-	if *agent == "" || *pane == "" {
+	if *agent == "" {
 		flag.Usage()
-		return fmt.Errorf("--agent and --pane are required")
+		return fmt.Errorf("--agent is required")
+	}
+
+	// Resolve the surface locator. Precedence:
+	//   1. --locator TYPE:VALUE (explicit, most specific)
+	//   2. --pane VALUE         (deprecated; assumed tmux:VALUE)
+	//   3. autodetect via env vars (DetectEngine in shim/engine.go)
+	//
+	// Steps 2 and 3 are tried in withDefaults; we only handle step 1 +
+	// the deprecation warning here. Validation (was anything resolved?)
+	// is shim.Config.validate.
+	resolvedLoc, paneForBackCompat, err := resolveLocator(*locator, *pane)
+	if err != nil {
+		flag.Usage()
+		return err
 	}
 
 	cfg := shim.Config{
 		Agent:             *agent,
-		Pane:              *pane,
+		Pane:              paneForBackCompat,
+		Locator:           resolvedLoc,
 		Owner:             firstNonEmpty(*owner, os.Getenv("ORCH_OWNER"), os.Getenv("USER")),
 		Session:           firstNonEmpty(*session, os.Getenv("SESH_SESSION")),
 		InstanceID:        *instanceID,
 		NATSURL:           shim.ReadNATSURL(*natsURL),
 		Outfit:            firstNonEmpty(*outfit, os.Getenv("ORCH_OUTFIT")),
 		Role:              firstNonEmpty(*role, os.Getenv("ORCH_ROLE")),
-		CWD:               firstNonEmpty(*cwd, resolveCWD(*pane)),
+		CWD:               firstNonEmpty(*cwd, resolveCWD(paneForBackCompat)),
 		Interval:          *interval,
 		PaneWatchInterval: *paneWatchInterval,
 		TaskID:            firstNonEmpty(*taskID, os.Getenv("ORCH_TASK_ID")),
 	}
 
-	a, err := buildAdapter(*agent, *pane, cfg.CWD)
+	a, err := buildAdapter(*agent, paneForBackCompat, cfg.CWD)
 	if err != nil {
 		return err
 	}
@@ -95,10 +115,51 @@ func run() error {
 	defer cancel()
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
-	log.Printf("orch-agent-shim starting: agent=%s pane=%s owner=%s nats=%s",
-		cfg.Agent, cfg.Pane, cfg.Owner, cfg.NATSURL)
+	log.Printf("orch-agent-shim starting: agent=%s pane=%s locator=%s owner=%s nats=%s",
+		cfg.Agent, cfg.Pane, cfg.Locator, cfg.Owner, cfg.NATSURL)
 
 	return shim.Run(ctx, cfg)
+}
+
+// resolveLocator picks the surface locator from the CLI flags. Returns:
+//
+//   - the resolved Locator (zero value when neither flag was passed —
+//     withDefaults will then attempt env-var autodetection),
+//   - the back-compat Pane string (used for adapter construction, the
+//     pane-watchdog, and metadata.pane_id),
+//   - an error for malformed --locator or empty --pane fallback.
+//
+// --locator wins outright; --pane is a deprecated alias that infers
+// engine=tmux and emits a stderr deprecation warning so operators see
+// the migration prompt without breaking their scripts. Passing neither
+// is fine here — autodetect runs in shim.withDefaults.
+func resolveLocator(locator, pane string) (shim.Locator, string, error) {
+	if locator != "" {
+		loc, err := shim.ParseLocator(locator)
+		if err != nil {
+			return shim.Locator{}, "", fmt.Errorf("--locator: %w", err)
+		}
+		// Keep Pane populated when the resolved engine is tmux so the
+		// existing tmux-keyed paths (resolveCWD, metadata.pane_id,
+		// pane-watchdog) still work. For cmux/zmx the legacy Pane field
+		// carries the engine-native id so the subject token derivation
+		// has something — orch's registry can read pane_id and find the
+		// worker; the typed locator metadata field is the migration
+		// path off pane_id.
+		return loc, loc.Value, nil
+	}
+	if pane != "" {
+		// Deprecated alias path. Emit one warning to stderr (not log,
+		// to avoid the LstdFlags prefix — operators reading the warning
+		// want a clean line) and infer tmux semantics.
+		fmt.Fprintln(os.Stderr, "orch-agent-shim: --pane is deprecated; use --locator tmux:"+pane+" instead. --pane will be removed in the next shim release.")
+		return shim.Locator{Engine: shim.EngineTmux, Value: pane}, pane, nil
+	}
+	// Neither flag passed — return zero-value so withDefaults runs the
+	// env-var autodetection path. The caller-side validation
+	// (shim.Config.validate) handles the "still nothing resolved" case
+	// with a clearer error than we could give from here.
+	return shim.Locator{}, "", nil
 }
 
 func buildAdapter(agent, pane, cwd string) (shim.Adapter, error) {

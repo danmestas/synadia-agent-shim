@@ -64,9 +64,15 @@ import (
 // Start(shimCtx) at boot; OnPrompt's per-turn ctx MUST NOT be
 // propagated to the watchers.
 type Adapter struct {
-	// Pane is the raw tmux pane id (e.g. "%37"). Used to derive the
-	// marker file paths and as the send-keys target.
+	// Pane is the raw tmux pane id (e.g. "%37"). On cmux/zmx workers,
+	// Pane carries the engine-native identifier so marker-keyed paths
+	// remain stable per worker.
 	Pane string
+
+	// Locator is the engine-aware target for realSendKeys / Abort
+	// (shim.LocatorSendKeys). Defaults to tmux:<Pane> via New; cmux/zmx
+	// callers use NewForLocator.
+	Locator shim.Locator
 
 	// StopMarkerDir / NotifyMarkerDir override the marker directories
 	// (default ~/.cache/orch-stop/ + ~/.cache/orch-notify/). Tests use
@@ -107,10 +113,24 @@ type Adapter struct {
 // key spec — critical for prompts containing C-c, Up, etc.)
 type SendKeysFunc func(pane, text string) error
 
-// New constructs an Adapter with reasonable defaults applied.
+// New constructs an Adapter with reasonable defaults applied. pane is
+// interpreted as a tmux pane id for back-compat; cmux/zmx callers use
+// NewForLocator.
 func New(pane string) *Adapter {
 	return &Adapter{
 		Pane:     pane,
+		Locator:  shim.Locator{Engine: shim.EngineTmux, Value: pane},
+		SendKeys: realSendKeys,
+		events:   make(chan shim.Chunk, 64),
+		stopCh:   make(chan struct{}),
+	}
+}
+
+// NewForLocator constructs an Adapter for an engine-aware Locator.
+func NewForLocator(loc shim.Locator) *Adapter {
+	return &Adapter{
+		Pane:     loc.Value,
+		Locator:  loc,
 		SendKeys: realSendKeys,
 		events:   make(chan shim.Chunk, 64),
 		stopCh:   make(chan struct{}),
@@ -172,6 +192,12 @@ func (a *Adapter) OnPrompt(ctx context.Context, text string) error {
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	// Engine-aware dispatch (shim/engine.go). See cc.go for the longer
+	// comment on why non-tmux engines bypass the legacy SendKeys
+	// closure.
+	if a.Locator.IsValid() && a.Locator.Engine != shim.EngineTmux {
+		return shim.LocatorSendKeys(a.Locator, text)
 	}
 	return a.SendKeys(a.Pane, text)
 }
@@ -502,9 +528,8 @@ func realSendKeys(pane, text string) error {
 }
 
 // Abort delivers the orch.signal.interrupt verb (see docs/orch-signals.md)
-// to the bound tmux pane by sending Ctrl-C. The in-pane gemini-cli REPL
-// interprets that as "stop the current generation"; the next prompt is
-// unaffected (Close is the teardown path).
+// to the bound surface via shim.LocatorInterrupt — engine-aware
+// (tmux C-c / cmux ctrl+c / zmx 0x03).
 //
 // No-op when Pane is empty (test harnesses occasionally construct the
 // adapter without a pane to exercise the marker loops).
@@ -512,7 +537,11 @@ func (a *Adapter) Abort(_ context.Context) error {
 	if a.Pane == "" {
 		return nil
 	}
-	return exec.Command("tmux", "send-keys", "-t", a.Pane, "C-c").Run()
+	loc := a.Locator
+	if !loc.IsValid() {
+		loc = shim.Locator{Engine: shim.EngineTmux, Value: a.Pane}
+	}
+	return shim.LocatorInterrupt(loc)
 }
 
 // Compile-time check that the Adapter satisfies shim.Adapter and shim.Aborter.

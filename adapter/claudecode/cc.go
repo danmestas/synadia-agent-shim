@@ -55,8 +55,18 @@ import (
 // always call Start explicitly.
 type Adapter struct {
 	// Pane is the raw tmux pane id (e.g. "%37"). Used to derive the
-	// marker file paths and as the send-keys target.
+	// marker file paths and as the legacy back-compat send-keys
+	// target. On cmux/zmx workers, Pane carries the engine-native
+	// identifier (cmux surface ref / zmx session name) so the
+	// marker-keyed paths still have a stable per-worker token —
+	// markers are per-worker, not per-tmux-pane.
 	Pane string
+	// Locator is the engine-aware target identifier used by realSendKeys
+	// and Abort to dispatch to the correct engine's verb (tmux send-keys
+	// / cmux send / zmx send). When zero-valued, realSendKeys falls back
+	// to a tmux:<Pane> locator for back-compat with pre-engine-aware
+	// callers; once those migrate, the fallback can be removed.
+	Locator shim.Locator
 	// CWD is the pane's working directory. Used to derive the
 	// claude transcript path: ~/.claude/projects/<encoded-cwd>/<sess>.jsonl
 	// where encoded-cwd replaces both `/` and `.` with `-`.
@@ -102,9 +112,30 @@ type Adapter struct {
 type SendKeysFunc func(pane, text string) error
 
 // New constructs an Adapter with reasonable defaults applied.
+//
+// pane is interpreted as a tmux pane id for back-compat — callers using
+// cmux/zmx should prefer NewForLocator. The adapter's Locator field
+// defaults to tmux:<pane>; orch-spawn (or the shim's CLI) can override
+// it after construction.
 func New(pane, cwd string) *Adapter {
 	return &Adapter{
 		Pane:     pane,
+		Locator:  shim.Locator{Engine: shim.EngineTmux, Value: pane},
+		CWD:      cwd,
+		SendKeys: realSendKeys,
+		events:   make(chan shim.Chunk, 64),
+		stopCh:   make(chan struct{}),
+	}
+}
+
+// NewForLocator constructs an Adapter for an engine-aware Locator. The
+// Pane field is populated with loc.Value for back-compat with the
+// marker-keyed file paths (each worker gets its own marker file keyed
+// on the surface id, irrespective of engine).
+func NewForLocator(loc shim.Locator, cwd string) *Adapter {
+	return &Adapter{
+		Pane:     loc.Value,
+		Locator:  loc,
 		CWD:      cwd,
 		SendKeys: realSendKeys,
 		events:   make(chan shim.Chunk, 64),
@@ -174,6 +205,18 @@ func (a *Adapter) OnPrompt(ctx context.Context, text string) error {
 	// don't bother shelling out.
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	// Engine-aware dispatch (shim/engine.go). When the Locator is set
+	// to a non-tmux engine, we cannot delegate to the legacy `SendKeys`
+	// closure — its signature is (pane, text) and its production
+	// implementation hard-codes `tmux send-keys`. Route around it.
+	//
+	// Tests still inject `SendKeys` for the tmux path (back-compat),
+	// which is the only engine the test recorders exercise; future
+	// engine-aware tests should set `Locator` directly and assert via
+	// the shim.LocatorSendKeys dispatch table in shim/engine_test.go.
+	if a.Locator.IsValid() && a.Locator.Engine != shim.EngineTmux {
+		return shim.LocatorSendKeys(a.Locator, text)
 	}
 	return a.SendKeys(a.Pane, text)
 }
@@ -576,9 +619,12 @@ func realSendKeys(pane, text string) error {
 }
 
 // Abort delivers the orch.signal.interrupt verb (see docs/orch-signals.md)
-// to the bound tmux pane by sending Ctrl-C. The in-pane claude-code REPL
-// interprets that as "stop the current generation"; the next prompt is
-// unaffected (Close is the teardown path).
+// to the bound surface. The in-pane claude-code REPL interprets a Ctrl-C
+// as "stop the current generation"; the next prompt is unaffected (Close
+// is the teardown path).
+//
+// Engine-aware via shim.LocatorInterrupt — tmux gets `send-keys C-c`,
+// cmux gets `send-key ctrl+c`, zmx gets a raw 0x03 byte over `send`.
 //
 // No-op when Pane is empty (test harnesses occasionally construct the
 // adapter without a pane to exercise the marker loops).
@@ -586,7 +632,11 @@ func (a *Adapter) Abort(_ context.Context) error {
 	if a.Pane == "" {
 		return nil
 	}
-	return exec.Command("tmux", "send-keys", "-t", a.Pane, "C-c").Run()
+	loc := a.Locator
+	if !loc.IsValid() {
+		loc = shim.Locator{Engine: shim.EngineTmux, Value: a.Pane}
+	}
+	return shim.LocatorInterrupt(loc)
 }
 
 // Compile-time check that Adapter satisfies shim.Adapter and shim.Aborter.
