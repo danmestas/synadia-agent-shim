@@ -99,10 +99,11 @@ then resolved defaults.
 | Flag       | Env             | Fallback                                  | Notes                                                      |
 |------------|-----------------|-------------------------------------------|------------------------------------------------------------|
 | `--agent`  | —               | (required)                                | `claude-code` (or `claude`), `codex`, `pi`, or `gemini`.   |
-| `--pane`   | —               | (required)                                | Raw tmux pane id, e.g. `%37`.                              |
+| `--locator`| —               | autodetect via `$CMUX_SURFACE_ID` / `$ZMX_SESSION` / `$TMUX_PANE` | Engine-aware surface locator: `tmux:%37`, `cmux:surface:30`, `zmx:engineer-a`. |
+| `--pane`   | —               | (deprecated)                              | Deprecated alias for `--locator tmux:VALUE`. Emits a stderr warning; removed next release. |
 | `--owner`  | `ORCH_OWNER`    | `$USER` / passwd lookup                   | Lands in metadata.owner.                                   |
 | `--session`| `SESH_SESSION`  | `""` (omitted from metadata)              | Marks the agent as session-aware per §3.2.                 |
-| `--nats`   | `NATS_URL`      | `~/.sesh/hub.url` → `nats://127.0.0.1:4222` | URL resolution per `shim.ReadNATSURL`.                     |
+| `--nats`   | `NATS_URL`      | `~/.sesh/hub.nats.url` → `nats://127.0.0.1:4222` | URL resolution per `shim.ReadNATSURL`.                     |
 | `--outfit` | `ORCH_OUTFIT`   | `""`                                      | orch-specific metadata (forward-compat per §12).           |
 | `--role`   | `ORCH_ROLE`     | `worker`                                  | orch-specific metadata.                                    |
 | `--cwd`    | —               | `tmux display-message -p '#{pane_current_path}'` | Used by the adapter to locate the transcript directory.    |
